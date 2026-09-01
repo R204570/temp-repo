@@ -50,3 +50,6 @@ knowledge_base/
 
 # Phase B measurement output: regenerate with `python measure.py`, never review it
 measurements/
+
+# structured request/behaviour logs (applog.py) — diagnostics, not source
+logs/

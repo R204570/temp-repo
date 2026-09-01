@@ -12,9 +12,11 @@ Claude Code get byte-identical behaviour from the same code path.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -24,8 +26,10 @@ from docsforge import (
     Doc, Fetcher, ForgeError, Options, _html_to_md, _median, combine,
     detect_source, forge, harvest, probe, write_docs,
 )
+import applog
 import harvest_jobs
 import reasoning
+import tracing
 
 # Cap what we hand back to a model — docs sites can be enormous and blowing the
 # context window helps nobody.
@@ -652,6 +656,14 @@ class _StripSink:
             re.sub(r"^<!-- source:.*?-->\n+", "", body, count=1, flags=re.S))
 
 
+#: How often a running harvest re-emits its page-fetch trace tick. Every
+#: single page would work — the trace id stays the same, so it never adds a
+#: DOM node — but there is no reason to take a lock and touch a queue 1,799
+#: times when 360 evenly-spaced updates read identically to a human.
+TICK_EVERY_PAGES = 5
+TICK_EVERY_SECONDS = 2.0
+
+
 class _CountingFetcher(Fetcher):
     """A Fetcher that reports how far it has got.
 
@@ -659,12 +671,20 @@ class _CountingFetcher(Fetcher):
     `harvest()`, touching each branch and risking the one thing this phase must
     not disturb. Counting successful page fetches costs one line and is
     accurate for the same reason: a page is fetched exactly once.
+
+    `stage`, when given, is the same counter re-expressed as a live trace
+    tick for the Web UI — throttled independently of `progress`, which stays
+    exact for `list_knowledge_base` because nothing here changes how often
+    *it* updates.
     """
 
-    def __init__(self, opts: Options, progress, stats: dict):
+    def __init__(self, opts: Options, progress, stats: dict,
+                stage: "tracing.Stage | None" = None):
         super().__init__(opts)
         self._progress = progress
         self._stats = stats
+        self._stage = stage
+        self._last_tick = 0.0
 
     def html(self, url: str) -> str:
         out = super().html(url)
@@ -673,6 +693,22 @@ class _CountingFetcher(Fetcher):
             # harvest() records the site's own count before it starts fetching
             # pages, so by the first page this is usually already true.
             self._progress.expected = self._stats.get("discovered")
+        if self._stage is not None:
+            now = time.time()
+            due = (self._progress.pages % TICK_EVERY_PAGES == 0
+                  or now - self._last_tick >= TICK_EVERY_SECONDS)
+            if due:
+                self._last_tick = now
+                expected = self._progress.expected
+                message = (f"fetched {self._progress.pages}/{expected} pages"
+                          if expected else f"fetched {self._progress.pages} pages")
+                counters = {"pages": self._progress.pages}
+                if expected:
+                    counters["expected"] = expected
+                try:
+                    self._stage.tick(message, counters=counters)
+                except Exception:
+                    pass  # a trace hiccup must never interrupt a harvest
         return out
 
 
@@ -680,12 +716,16 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
                       js: bool = False, scope: str = "section",
                       version: str | None = None, intent: str = "",
                       corpora: list | None = None, strict: bool = False,
-                      progress=None) -> str:
+                      progress=None,
+                      trace: "tracing.TraceContext | None" = None) -> str:
     """Harvest a WHOLE documentation set and store it in the knowledge base.
 
     `progress` is not in the tool schema and no model passes it: it is how a
-    background harvest reports itself to `list_knowledge_base`.
+    background harvest reports itself to `list_knowledge_base`. `trace` is
+    the same idea for the Web UI's execution timeline instead of a status
+    poll — also not in the schema, also never seen by a model.
     """
+    trace = trace or tracing.NULL_CONTEXT
     opts = _options(crawl=True, max_pages=max_pages, js=js, delay=0.2,
                     cap=HARVEST_PAGE_CAP)
     opts.scope = scope or "section"
@@ -706,19 +746,36 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
 
     with reasoning.active(reasoner), store().writer(slug, provisional, url,
                                                     "crawl") as writer:
-        sink = _StripSink(writer)
-        if progress is None:
-            docs, strategy = harvest(url, opts, stats=stats, sink=sink)
-        else:
-            with _CountingFetcher(opts, progress, stats) as fetcher:
-                docs, strategy = harvest(url, opts, fetcher=fetcher, stats=stats,
-                                         sink=sink)
+        # Opened by hand rather than `with trace.stage(...) as sub:`, because
+        # the fetcher below must be able to `.tick()` this same stage *while*
+        # `harvest()` is still running, not only report it once the call
+        # returns.
+        harvest_stage = trace.stage("harvesting", message="acquiring pages",
+                                    target=url)
+        harvest_stage.start()
+        try:
+            sink = _StripSink(writer)
+            if progress is None:
+                docs, strategy = harvest(url, opts, stats=stats, sink=sink)
+            else:
+                with _CountingFetcher(opts, progress, stats,
+                                      stage=harvest_stage) as fetcher:
+                    docs, strategy = harvest(url, opts, fetcher=fetcher, stats=stats,
+                                             sink=sink)
+        except BaseException as e:
+            harvest_stage.finish(tracing.FAILED, error=f"{type(e).__name__}: {e}")
+            raise
         if progress is not None:
             progress.phase = "storing"
         if not docs:
             # Abandoned rather than settled: whatever was already stored under
             # this label stays exactly as it was.
+            harvest_stage.finish(tracing.FAILED, error="nothing was harvested")
             raise ForgeError(f"Harvested nothing from {url}")
+        harvest_stage.finish(
+            tracing.COMPLETED, message=f"{len(docs)} pages via {strategy}",
+            result={"pages": len(docs), "strategy": strategy,
+                   "expected": stats.get("discovered")})
 
         # v3 and v2 of the same library contradict each other, so they are
         # stored side by side rather than one overwriting the other.
@@ -729,8 +786,10 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
         # as "this is the whole thing", and must not be reported as one.
         whole = False if truncated else stats.get("whole")
         expected = stats.get("discovered")
-        entry = writer.settle(complete=whole, expected=expected,
-                              version=label, strategy=strategy)
+        with trace.stage("storing", message="writing pages to the knowledge base",
+                         target=slug):
+            entry = writer.settle(complete=whole, expected=expected,
+                                  version=label, strategy=strategy)
 
     # Pages the store itself refused — too large to index, most often. They
     # were reached and extracted, so they are disclosed rather than lost.
@@ -747,11 +806,23 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
     # that got all of one corpus and half of another announced itself complete,
     # with the shortfall visible only to a reader who scrolled to the note at
     # the bottom. Invariant 9 says the roll-up is the headline.
+    federation_stage = trace.stage("corpus selection",
+                                   message="checking for related corpora")
+    federation_stage.start()
     with reasoning.active(reasoner):
-        note = _federate(name or slug, url, stats, intent=intent,
-                         explicit=_corpus_list(corpora), strict=bool(strict),
-                         max_pages=max_pages, js=js)
+        try:
+            note = _federate(name or slug, url, stats, intent=intent,
+                             explicit=_corpus_list(corpora), strict=bool(strict),
+                             max_pages=max_pages, js=js)
+        except BaseException as e:
+            federation_stage.finish(tracing.FAILED, error=f"{type(e).__name__}: {e}")
+            raise
     across = stats.get("federation") or {}
+    federation_stage.finish(
+        tracing.COMPLETED,
+        message=(f"{across.get('selected', 0)} of {across.get('corpora', 1)} "
+                 f"corpora selected" if across else "no related corpora"),
+        result=across or None)
     if across.get("corpora", 1) > 1 and across.get("complete") != whole:
         whole = across.get("complete")
         truncated = False           # the shortfall is another corpus's, not a cap
@@ -798,6 +869,12 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
     warning += note
 
     where = entry["file"]
+    trace.event(
+        "harvest_docs completed", message=f"{len(docs)} pages via {strategy}",
+        target=url,
+        result={"pages": len(docs), "characters": entry["characters"],
+               "strategy": strategy, "complete": whole, "truncated": truncated,
+               "seconds": round(time.time() - started, 1)})
     return (
         f"Harvested **{slug}** {label} — {len(docs)} pages, "
         f"{entry['characters']:,} characters, "
@@ -1000,8 +1077,10 @@ def tool_learn_technology(name: str, version: str | None = None,
                           ecosystem: str | None = None, max_pages: int = 0,
                           js: bool = False, intent: str = "",
                           corpora: list | None = None,
-                          strict: bool = False) -> str:
+                          strict: bool = False,
+                          trace: "tracing.TraceContext | None" = None) -> str:
     """Learn a technology from its name alone: resolve, verify, harvest, store."""
+    trace = trace or tracing.NULL_CONTEXT
     # File under the canonical form, not the caller's spelling. Otherwise
     # "Effect.ts" and "effect" become two copies of the same library, and the
     # second harvest silently re-crawls a site already stored under the first.
@@ -1014,6 +1093,10 @@ def tool_learn_technology(name: str, version: str | None = None,
         backend = store()
         entry = backend.entry(known, version)
         if entry is not None:
+            trace.event("already stored", target=name,
+                       message=f"{known} {entry['version']} — nothing fetched",
+                       result={"technology": known, "version": entry["version"],
+                              "pages": entry["pages"]})
             return (
                 f"**{known}** {entry['version']} is already stored — "
                 f"{entry['pages']} pages, harvested {entry['harvested']}.\n\n"
@@ -1031,27 +1114,61 @@ def tool_learn_technology(name: str, version: str | None = None,
 
     def work(progress: harvest_jobs.Progress) -> str:
         """Resolve then harvest. Runs on a worker thread past the deadline."""
-        progress.phase = "resolving"
-        found = _resolve(name, ecosystem=(ecosystem or "").strip())
-        if found.best is None:
-            listed = "\n".join(f"- {c.url} ({c.reason or 'unverified'})"
-                               for c in found.candidates)
-            raise ForgeError(
-                (found.note or f"Could not find documentation for {name!r}.")
-                + (f"\n\nCandidates considered:\n{listed}" if listed else "")
-                + "\n\nIf you know the URL, call harvest_docs with it directly."
-            )
+        try:
+            progress.phase = "resolving"
+            resolve_stage = trace.stage("resolving identity",
+                                        message="finding official documentation",
+                                        target=name)
+            resolve_stage.start()
+            try:
+                found = _resolve(name, ecosystem=(ecosystem or "").strip())
+            except BaseException as e:
+                resolve_stage.finish(tracing.FAILED, error=f"{type(e).__name__}: {e}")
+                raise
+            if found.best is None:
+                listed = "\n".join(f"- {c.url} ({c.reason or 'unverified'})"
+                                   for c in found.candidates)
+                # Every candidate DocsForge looked at and rejected, not just
+                # the fact that none worked -- this is the "what result was
+                # produced" answer for a failed resolution, sourced straight
+                # from Resolution.as_dict() rather than re-derived here.
+                resolve_stage.finish(
+                    tracing.FAILED,
+                    error=found.note or f"could not find documentation for {name!r}",
+                    result=found.as_dict())
+                raise ForgeError(
+                    (found.note or f"Could not find documentation for {name!r}.")
+                    + (f"\n\nCandidates considered:\n{listed}" if listed else "")
+                    + "\n\nIf you know the URL, call harvest_docs with it directly."
+                )
+            resolve_stage.finish(
+                tracing.COMPLETED,
+                message=f"resolved to {found.best.url} via {found.resolved_via or 'registry'}",
+                result=found.as_dict())
 
-        progress.url = found.best.url
-        progress.phase = "harvesting"
-        harvested = tool_harvest_docs(url=found.best.url, name=slug,
-                                      max_pages=max_pages, js=js, version=version,
-                                      intent=intent, corpora=corpora,
-                                      strict=strict, progress=progress)
-        return (
-            f"{note}Resolved **{name}** to {found.best.url}\n"
-            f"({found.best.evidence}; {found.best.reason})\n\n{harvested}"
-        )
+            progress.url = found.best.url
+            progress.phase = "harvesting"
+            harvested = tool_harvest_docs(url=found.best.url, name=slug,
+                                          max_pages=max_pages, js=js, version=version,
+                                          intent=intent, corpora=corpora,
+                                          strict=strict, progress=progress, trace=trace)
+            return (
+                f"{note}Resolved **{name}** to {found.best.url}\n"
+                f"({found.best.evidence}; {found.best.reason})\n\n{harvested}"
+            )
+        finally:
+            # Closing here is only correct once run_tool() has *already*
+            # given up ownership of this trace by detaching (the deadline
+            # passed and it returned "still running" without closing it).
+            # In the common case -- work() finishes inside the deadline --
+            # run_tool() is still on the stack above `tool.fn()` and has
+            # not detached; it closes the trace itself once `tool.fn()`
+            # actually returns, which happens after any error-handling
+            # event run_tool() still needs to add. Closing unconditionally
+            # here would race that and could close the trace before that
+            # event is recorded.
+            if trace.is_detached():
+                trace.close()
 
     # The harvest starts on its own thread and we wait on it -- but only up to
     # the deadline. Anything finishing in time returns exactly what it always
@@ -1064,6 +1181,10 @@ def tool_learn_technology(name: str, version: str | None = None,
             raise job.exc
         return job.result
 
+    # Still running past the deadline: run_tool() must not close this trace
+    # when this call returns, because `work()` -- and the trace events it is
+    # still emitting -- keeps going on its own thread after this line.
+    trace.detach()
     return _still_harvesting(job)
 
 
@@ -1612,6 +1733,23 @@ if ALLOW_DELETE:
 
 BY_NAME = {t.name: t for t in TOOLS}
 
+#: Tool functions willing to report an execution trace, discovered once from
+#: their real signature rather than a second, separately-maintained list --
+#: a tool that gains a `trace` parameter is traced automatically, and one
+#: that never does costs nothing extra here.
+_TRACED = {t.name for t in TOOLS if "trace" in inspect.signature(t.fn).parameters}
+
+#: The trace id `run_tool` minted for the most recent call *on this thread*.
+#: app.py reads it immediately after relaying a provider's `tool_end` event
+#: -- reliable because both happen on the same thread, in the order the call
+#: actually ran: `run_tool` only returns once `tool.fn` has, and no other
+#: tool call can interleave on one thread inside one provider's loop.
+_last_trace = threading.local()
+
+
+def last_trace_id() -> str | None:
+    return getattr(_last_trace, "value", None)
+
 
 def openai_tools() -> list[dict]:
     """Tool schemas in the OpenAI/Groq `tools=[...]` format."""
@@ -1630,17 +1768,57 @@ def openai_tools() -> list[dict]:
 
 def run_tool(name: str, arguments: dict[str, Any]) -> str:
     """Dispatch a tool call. Errors come back as text so a model can recover
-    from them rather than the whole turn dying."""
+    from them rather than the whole turn dying.
+
+    Every call gets a trace, whether or not the tool underneath actually
+    reports anything into it: an untraced tool's Trace simply stays empty,
+    which is a truthful (if uninteresting) execution timeline rather than a
+    missing one. What varies is only whether `tool.fn` was written to fill
+    it in -- see `_TRACED`.
+    """
     tool = BY_NAME.get(name)
     if tool is None:
         return f"Error: unknown tool {name!r}. Available: {', '.join(BY_NAME)}"
+
+    ctx = tracing.start(name)
+    _last_trace.value = ctx.trace_id
+    started = time.perf_counter()
     try:
         allowed = set((tool.schema.get("properties") or {}).keys())
         kwargs = {k: v for k, v in (arguments or {}).items() if k in allowed}
-        return tool.fn(**kwargs)
+        if name in _TRACED:
+            kwargs["trace"] = ctx
+        result = tool.fn(**kwargs)
+        duration_ms = (time.perf_counter() - started) * 1000
+        try:
+            applog.tool_call(name, ok=True, duration_ms=duration_ms,
+                             trace_id=ctx.trace_id, chars=len(result))
+        except Exception:
+            pass
+        return result
     except ForgeError as e:
-        return f"Error: {e}"
+        return _tool_error(name, ctx, started, f"Error: {e}", str(e))
     except TypeError as e:
-        return f"Error: bad arguments for {name}: {e}"
+        return _tool_error(name, ctx, started, f"Error: bad arguments for {name}: {e}", str(e))
     except Exception as e:  # a scrape can fail in a hundred ways
-        return f"Error: {type(e).__name__}: {e}"
+        return _tool_error(name, ctx, started, f"Error: {type(e).__name__}: {e}", str(e))
+    finally:
+        # A tool whose real work continues past this call (a harvest still
+        # running on a background thread) calls `ctx.detach()` before
+        # returning, precisely so this does not cut its trace off early --
+        # see tool_learn_technology's still-running path, which closes it
+        # itself once the background thread actually finishes.
+        if not ctx.is_detached():
+            ctx.close()
+
+
+def _tool_error(name: str, ctx: "tracing.TraceContext", started: float,
+                message: str, detail: str) -> str:
+    ctx.event("tool failed", state=tracing.FAILED, error=detail)
+    duration_ms = (time.perf_counter() - started) * 1000
+    try:
+        applog.tool_call(name, ok=False, duration_ms=duration_ms,
+                         trace_id=ctx.trace_id, error=detail)
+    except Exception:
+        pass
+    return message

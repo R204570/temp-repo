@@ -24,11 +24,12 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Iterator
 
 import nh3
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
@@ -36,8 +37,10 @@ from pydantic import BaseModel, Field
 
 load_dotenv(find_dotenv(usecwd=True))
 
+import applog  # noqa: E402
 import forge_tools  # noqa: E402  (after load_dotenv so tool config sees .env)
 import providers  # noqa: E402
+import tracing  # noqa: E402
 from docsforge import enable_utf8_console  # noqa: E402
 from kb_store import StoreError  # noqa: E402
 from providers import MAX_CONTENT, MAX_HISTORY, ProviderError  # noqa: E402
@@ -157,10 +160,16 @@ def _sse(event: str, data: dict) -> str:
 
 def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]:
     """Drive the chosen provider, mapping its events onto SSE."""
+    turn_started = time.perf_counter()
+    tool_log: list[str] = []          # the "behaviour pattern" this turn traced
+    outcome = "error"
+
     try:
         provider = providers.get(provider_name)
     except ProviderError as e:
         yield _sse("error", {"message": str(e)})
+        applog.turn(tool_log, "provider_unavailable",
+                   (time.perf_counter() - turn_started) * 1000)
         return
 
     answer: list[str] = []
@@ -178,6 +187,13 @@ def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]
             elif kind == "tool_start":
                 yield _sse("tool", {"phase": "start", "name": event["name"], "args": event["args"]})
             elif kind == "tool_end":
+                # `run_tool()` just ran, synchronously, on this same thread --
+                # its trace id is still sitting in the thread-local it set,
+                # so the Web UI can open a live/replay view of exactly this
+                # tool call without app.py needing to plumb the id through
+                # the provider's own event shape.
+                trace_id = forge_tools.last_trace_id()
+                tool_log.append(f"{event['name']}:{'ok' if event['ok'] else 'error'}")
                 yield _sse("tool", {
                     "phase": "end",
                     "name": event["name"],
@@ -185,11 +201,13 @@ def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]
                     "chars": event["chars"],
                     "kind": event["kind"],
                     "preview": event["preview"],
+                    "trace_id": trace_id,
                 })
             elif kind == "notice":
                 yield _sse("notice", {"message": event["message"]})
 
         markdown = "".join(answer).strip() or "_(no response generated)_"
+        outcome = "done"
         yield _sse("done", {
             "markdown": markdown,
             "html": render_markdown(markdown),
@@ -198,9 +216,51 @@ def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]
         })
 
     except ProviderError as e:
+        outcome = "provider_error"
         yield _sse("error", {"message": str(e)})
+    except GeneratorExit:
+        # The client disconnected (the Stop button, a closed tab) and
+        # Starlette stopped iterating us. This is a *client* stopping, not
+        # DocsForge failing -- logged as its own outcome so a "how did this
+        # turn end" grep does not conflate the two. Whatever tool call was
+        # in flight keeps running server-side; nothing here cancels it, see
+        # tracing.TraceContext.detach().
+        outcome = "cancelled"
+        raise
     except Exception as e:  # network blips, bad key, model errors
+        outcome = "error"
         yield _sse("error", {"message": f"{type(e).__name__}: {e}"})
+    finally:
+        applog.turn(tool_log, outcome, (time.perf_counter() - turn_started) * 1000,
+                   provider=provider_name or "")
+
+
+def trace_stream(trace_id: str) -> Iterator[str]:
+    """Live execution timeline for one tool call.
+
+    Opened by the browser as soon as a `tool_end` SSE event carries a
+    `trace_id` — a second, independent HTTP connection, which is what makes
+    this genuinely live rather than polled: it runs on its own thread, so it
+    keeps reading `Trace.subscribe()` for as long as the underlying tool call
+    keeps appending to it, whether that call is still on the original chat
+    request's thread or, past `learn_technology`'s deadline, a harvest_jobs
+    background thread the original request already returned from.
+
+    Event names deliberately avoid the bare `error` EventSource already
+    treats specially (it fires that on the browser's own reconnect logic,
+    with no `data` to parse) -- `trace_error` and `trace_end` are ours.
+    """
+    trace = tracing.get(trace_id)
+    if trace is None:
+        yield _sse("trace_error", {"message": f"No trace {trace_id!r} (finished "
+                                   f"and pruned, or the server restarted)."})
+        return
+    for event in trace.subscribe():
+        yield _sse("trace", event.as_dict())
+    # The trace closed -- tell the browser so it can stop this EventSource
+    # rather than let it auto-reconnect to a stream that will only ever
+    # replay the same, now-finished, history.
+    yield _sse("trace_end", {"trace_id": trace_id})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -211,6 +271,22 @@ def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]
 # URL goes to the page users are sent to; the schema stays at /openapi.json.
 app = FastAPI(title="DocsForge Chat", version="1.3.0",
               docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def _log_requests(request: Request, call_next):
+    """One log line per HTTP request -- the other half of 'debugging is
+    easy and fast': `tracing`/`applog.turn` cover tool-call behaviour,
+    this covers the requests that triggered them."""
+    started = time.perf_counter()
+    response = await call_next(request)
+    try:
+        applog.request(request.method, request.url.path, response.status_code,
+                       (time.perf_counter() - started) * 1000,
+                       client=request.client.host if request.client else "")
+    except Exception:
+        pass
+    return response
 
 
 # Served with `Last-Modified` but no cache directive, a browser is free to
@@ -416,6 +492,22 @@ def chat(req: ChatRequest):
         return JSONResponse({"detail": "No messages provided."}, status_code=400)
     return StreamingResponse(
         chat_stream(history, req.provider),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/trace/{trace_id}")
+def trace(trace_id: str):
+    """The execution timeline for one tool call: what it is doing (or did)
+    underneath the single work row the chat stream shows. A second SSE
+    connection, deliberately -- see `trace_stream`."""
+    return StreamingResponse(
+        trace_stream(trace_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
