@@ -1,0 +1,113 @@
+# Packaging for DocsForge.
+#
+# Until this file existed there was no way to install DocsForge except to clone
+# it, which made `pipx install docsforge` impossible rather than merely
+# unimplemented. Both commands below are the product surface:
+#
+#   pipx install docsforge                     # docsforge + docsforge-mcp
+#   uvx --from docsforge docsforge-mcp         # MCP server, no install
+#
+# Dependency policy: the four packages whose float has actually broken a build
+# carry upper bounds here. requirements.txt pins them exactly for CI and
+# development; this file states the range the code is known to work across.
+# Abstract ranges here, concrete pins there — they are not two copies of one
+# list, and neither is authoritative for the other's job.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docsforge"
+dynamic = ["version"]                      # single source: docsforge.__version__
+description = "Gives a model documentation for technologies it was not trained on — with a coverage figure you can gate on."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Raj Patel" }]
+keywords = ["documentation", "mcp", "llm", "scraping", "knowledge-base"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Documentation",
+]
+
+# Core = extraction + the MCP surface. The MCP server is the headline entry
+# point, so shipping it in an extra would mean the marquee command does not
+# work after a default install.
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12,<5",     # 4.13 changed .string on nested tags
+    "markdownify>=0.13,<2",        # 1.0 was a breaking release
+    "lxml>=5.0",                   # real XML parser; handle_sitemap needs one
+    "PyYAML>=6.0",                 # YAML OpenAPI specs
+    "mcp>=2.0,<3",                 # v2 API: mcp.server.MCPServer
+    "anyio>=4.0",
+    "pydantic>=2.0,<3",
+]
+
+[project.optional-dependencies]
+# Web chat (app.py). Static assets live beside app.py and are not installed by
+# a wheel, so the web UI is a checkout-only surface for now; the extra exists
+# so `pip install -e .[web]` in a clone pulls the right packages.
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "python-dotenv>=1.0",
+    "markdown-it-py>=3.0",
+    "linkify-it-py>=2.0",          # auto-links bare URLs in rendered output
+    "nh3>=0.2,<0.4",               # sanitises scraped HTML before it renders
+]
+postgres = ["psycopg[binary]>=3.1"]          # else harvests are Markdown files
+js = ["playwright>=1.40"]                    # then: playwright install chromium
+
+# One SDK per provider. Each is imported lazily and reports a clear error when
+# its package is missing, so none of these belong in core.
+# providers/claudecode.py needs no package at all — it drives the `claude` CLI.
+groq = ["groq>=0.11"]
+anthropic = ["anthropic>=0.70"]
+openai = ["openai>=1.40"]                    # also serves providers/ollama.py
+gemini = ["google-genai>=1.0"]
+providers = ["docsforge[groq,anthropic,openai,gemini]"]
+
+all = ["docsforge[web,postgres,js,providers]"]
+dev = ["docsforge[all]", "pytest>=8.0"]
+
+[project.scripts]
+docsforge = "docsforge:main"
+docsforge-mcp = "mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/R204570/DocsForge"
+Issues = "https://github.com/R204570/DocsForge/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "docsforge.__version__" }
+
+# Flat modules, not a src/ package. Listing them explicitly beats auto-discovery,
+# which would sweep up tests/, venv/ and knowledge_base/.
+[tool.setuptools]
+py-modules = [
+    "docsforge",
+    "federation",
+    "forge_tools",
+    "harvest_jobs",
+    "instrument",
+    "observation",
+    "passages",
+    "selection",
+    "mcp_server",
+    "resolver",
+    "kb_store",
+    "manifests",
+    "versions",
+    "app",
+]
+
+[tool.setuptools.packages.find]
+include = ["providers*"]

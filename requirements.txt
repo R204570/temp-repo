@@ -1,0 +1,48 @@
+# Concrete, reproducible environment for CI and development.
+#
+# pyproject.toml states the RANGE each dependency is known to work across;
+# this file pins the four whose float has actually broken a build. Zero pins
+# is how a green suite turns red with no code change, so the packages that
+# decide whether extraction, sanitising and the MCP surface still work are
+# fixed here and moved deliberately.
+#
+#   pip install -r requirements.txt      # this exact set
+#   pip install -e .[dev]                # the ranges, resolver's choice
+#
+# ── core extraction (docsforge.py CLI) ───────────────────
+requests>=2.31
+beautifulsoup4==4.15.0   # PINNED: .string/.text behaviour decides extraction
+markdownify==1.2.3       # PINNED: 1.0 was breaking; output is asserted verbatim
+lxml>=5.0            # XML parser for sitemaps; handle_sitemap needs a real one
+PyYAML>=6.0          # YAML OpenAPI specs
+
+# ── MCP server (mcp_server.py) ───────────────────────────
+mcp==2.0.0
+anyio>=4.0
+pydantic>=2.0
+
+# ── web chat (app.py) ────────────────────────────────────
+fastapi>=0.110
+uvicorn>=0.27
+python-dotenv>=1.0
+markdown-it-py>=3.0
+linkify-it-py>=2.0   # auto-links bare URLs in rendered output
+nh3==0.3.6               # PINNED: sanitiser; a silent change is a security change
+
+# ── model providers (providers/) ─────────────────────────
+# You only need the SDK for the provider(s) you actually use; each one is
+# imported lazily and reports a clear error if its package is missing.
+# providers/claudecode.py needs no package at all — it drives the `claude` CLI.
+groq>=0.11           # providers/groq.py
+anthropic>=0.70      # providers/claude.py
+openai>=1.40         # providers/chatgpt.py AND providers/ollama.py (OpenAI-compatible)
+google-genai>=1.0    # providers/gemini.py
+
+# ── knowledge-base storage ───────────────────────────────
+# Optional. Without it, harvests are Markdown files in knowledge_base/;
+# with DOCSFORGE_DB set, they go to Postgres with a full-text index.
+psycopg[binary]>=3.1
+
+# ── optional ─────────────────────────────────────────────
+# playwright        # only needed for --js / js:true; then: playwright install chromium
+# pytest            # to run tests/
