@@ -855,36 +855,142 @@ def _split_dump(text: str, above: int = SPLIT_ABOVE) -> list[tuple[str, str]]:
     return parts
 
 
+def _classify_manifest_links(links: list[tuple[str, str]], base_url: str
+                             ) -> tuple[list[tuple[str, str]], int]:
+    """Split manifest links `parse_llms_links()` already validated into ones
+    this harvest will try to acquire and ones it intentionally leaves out.
+
+    The exclusion applied here is host: a link off the site the docs are
+    published on (a GitHub badge, a support form, a partner's own
+    changelog) is not part of the documentation being asked for, and
+    counting it toward `expected` would make an untouchable page look like
+    a missing one. `parse_llms_links()` has already dropped the invalid
+    kind (bad scheme, anchors, mailto), so what is left to sort is real
+    absolute URLs — actionable ones and off-site ones.
+
+    Returns (actionable_links, excluded_count).
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    actionable, excluded = [], 0
+    for title, link in links:
+        if (urlparse(link).hostname or "").lower() != host:
+            excluded += 1
+            continue
+        actionable.append((title, link))
+    return actionable, excluded
+
+
+def _categorize_failure(exc: Exception) -> str:
+    """A coarse bucket for a failed manifest-page fetch.
+
+    Read off what `Fetcher` and `_extract_page` actually raise — a
+    `ForgeError` wrapping either a `requests` exception or an HTTP status —
+    rather than a parallel error-code system. Coarse on purpose: enough for
+    a future retry pass to tell "worth trying again" apart from "this page
+    will never work" without over-building on a single hardening pass.
+    """
+    cause = exc.__cause__
+    if isinstance(cause, requests.exceptions.Timeout):
+        return "timeout"
+    if isinstance(cause, requests.exceptions.RequestException):
+        return "network_error"
+    msg = str(exc)
+    if re.match(r"HTTP \d+", msg):
+        return "http_error"
+    if "Not a text document" in msg:
+        return "unsupported_content"
+    if "reads like documentation" in msg:
+        return "extraction_failure"
+    return "invalid_response"
+
+
+def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
+                            opts: Options) -> tuple[list[Doc], list[dict]]:
+    """Fetch every manifest link, keeping successes and failures apart.
+
+    A failure here is one page out of a promised set, not the whole
+    acquisition, so it is recorded and skipped rather than allowed to abort
+    the rest of the manifest or vanish silently. Each failure record keeps
+    a normalized URL, a coarse category, and a short detail — enough for a
+    future targeted retry to operate on the failed subset instead of
+    reacquiring everything, without dumping a full traceback into a
+    user-facing result.
+    """
+    docs: list[Doc] = []
+    failed: list[dict] = []
+    for title, link_url in links:
+        try:
+            if llmsfinder.is_markdown_link(link_url):
+                text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
+                docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
+            else:
+                doc_title, md = _extract_page(link_url, fetcher, opts)
+                docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
+        except Exception as e:
+            failed.append({
+                "url": _normalize(link_url),
+                "category": _categorize_failure(e),
+                "detail": str(e)[:200],
+            })
+    return docs, failed
+
+
 def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
-                    stats: dict | None = None) -> list[Doc]:
+                    stats: dict | None = None,
+                    restrict_links: list[tuple[str, str]] | None = None) -> list[Doc]:
+    """Acquire documentation from a detected llms.txt / llms-full.txt source.
+
+    `restrict_links` is set by `harvest()` when the caller asked for one
+    version of the docs and the manifest could be safely filtered to it
+    (see `_llms_txt_version_scope`). When present it replaces whatever
+    `parse_llms_links()` would find in the body, so acquisition only ever
+    touches pages already proven to belong to that version.
+    """
     body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
     body = body.strip()
 
     shape = llmsfinder.classify_llms_shape(body)
 
-    if shape == "index":
-        links = llmsfinder.parse_llms_links(body, det.url)
-        if links:
+    if shape in ("index", "hybrid"):
+        raw_links = restrict_links if restrict_links is not None else llmsfinder.parse_llms_links(body, det.url)
+        links, excluded = _classify_manifest_links(raw_links, det.url)
+        if excluded:
+            _log(opts, f"  excluded {excluded} off-site manifest link(s) from the expected count")
+
+        if shape == "hybrid":
+            # A hybrid manifest promises two different things: its own root
+            # prose (already in hand as `body`) and whatever pages its links
+            # describe. The two are recorded separately so root success can
+            # never stand in for corpus completeness.
+            root_doc = Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)
+            docs, failed = _acquire_manifest_links(links, fetcher, opts)
             expected_count = len(links)
-            docs: list[Doc] = []
-            failed_urls: list[tuple[str, str]] = []
-
-            for title, link_url in links:
-                if llmsfinder.is_markdown_link(link_url):
-                    try:
-                        text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
-                        docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
-                    except Exception as e:
-                        failed_urls.append((link_url, str(e)))
-                else:
-                    try:
-                        doc_title, md = _extract_page(link_url, fetcher, opts)
-                        docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
-                    except Exception as e:
-                        failed_urls.append((link_url, str(e)))
-
             acquired_count = len(docs)
-            failed_count = len(failed_urls)
+            failed_count = len(failed)
+            is_whole = acquired_count == expected_count
+
+            if stats is not None:
+                stats["expected"] = expected_count
+                stats["discovered"] = expected_count + 1
+                stats["acquired"] = acquired_count
+                stats["fetched"] = acquired_count + 1
+                stats["failed"] = failed_count
+                stats["failed_urls"] = failed
+                stats["whole"] = is_whole
+                if not is_whole:
+                    stats["reason"] = (
+                        f"hybrid root document stored, but {failed_count} of {expected_count} "
+                        f"manifest linked pages could not be acquired"
+                    )
+
+            return [root_doc] + docs
+
+        # shape == "index"
+        if links:
+            docs, failed = _acquire_manifest_links(links, fetcher, opts)
+            expected_count = len(links)
+            acquired_count = len(docs)
+            failed_count = len(failed)
             is_whole = (acquired_count == expected_count and expected_count > 0)
 
             if stats is not None:
@@ -893,6 +999,7 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                 stats["acquired"] = acquired_count
                 stats["fetched"] = acquired_count
                 stats["failed"] = failed_count
+                stats["failed_urls"] = failed
                 stats["whole"] = is_whole
                 if not is_whole:
                     stats["reason"] = (
@@ -904,56 +1011,64 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                 _log(opts, f"  harvested {len(docs)}/{expected_count} pages from llms.txt index manifest")
                 return docs
 
-    if shape == "hybrid":
-        root_doc = Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)
-        links = llmsfinder.parse_llms_links(body, det.url)
-        expected_count = len(links)
-        acquired_docs: list[Doc] = []
-        failed_urls: list[tuple[str, str]] = []
+            # Every linked page failed: report the failure rather than
+            # falling through to the raw-dump path below and calling a
+            # manifest nobody could resolve a single page from "complete".
+            _log(opts, f"  0/{expected_count} pages resolved from llms.txt index manifest")
+            return []
 
-        for title, link_url in links:
-            if llmsfinder.is_markdown_link(link_url):
-                try:
-                    text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
-                    acquired_docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
-                except Exception as e:
-                    failed_urls.append((link_url, str(e)))
-            else:
-                try:
-                    doc_title, md = _extract_page(link_url, fetcher, opts)
-                    acquired_docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
-                except Exception as e:
-                    failed_urls.append((link_url, str(e)))
-
-        acquired_count = len(acquired_docs)
-        failed_count = len(failed_urls)
-        is_whole = (acquired_count == expected_count and expected_count > 0)
-
-        if stats is not None:
-            stats["expected"] = expected_count
-            stats["discovered"] = expected_count + 1
-            stats["acquired"] = acquired_count
-            stats["fetched"] = acquired_count + 1
-            stats["failed"] = failed_count
-            stats["whole"] = is_whole
-            if not is_whole:
-                stats["reason"] = (
-                    f"hybrid root document stored, but {failed_count} of {expected_count} "
-                    f"manifest linked pages could not be acquired"
-                )
-
-        return [root_doc] + acquired_docs
-
-    # Shape B (dump): content is stored whole as one Markdown document.
+    # Shape B (dump), or an index/hybrid manifest with no actionable link at
+    # all: content is stored whole as one Markdown document. When there was
+    # no actionable link, this genuinely is the whole of what the manifest
+    # promised — not a fallback pretending a failed manifest is complete.
     if stats is not None:
         stats["expected"] = 1
         stats["discovered"] = 1
         stats["acquired"] = 1
         stats["fetched"] = 1
         stats["failed"] = 0
+        stats["failed_urls"] = []
         stats["whole"] = True
 
     return [Doc(det.url, "llms.txt", _meta_header(det.url, "llms.txt") + body)]
+
+
+def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
+                            ) -> list[tuple[str, str]] | None:
+    """Manifest links safely identifiable as belonging to the version `url`
+    names, or None when the manifest cannot be scoped that way.
+
+    Reuses `docs_scope()` — the same version-anchored prefix the crawl path
+    already stays inside — instead of inventing a second way to detect a
+    version. A link only survives if its own path starts with that exact
+    prefix, so this can narrow a site-wide manifest down to one version but
+    can never admit another version into it: the worst it can do wrong is
+    return too little, never too much.
+
+    None means there is nothing reliable to filter by: the request's own
+    prefix does not end on a version segment, the manifest is a dump with no
+    per-page URLs to check it against, or filtering leaves nothing. Either
+    way the caller should fall back to the version-scoped crawler instead of
+    trusting a manifest that cannot prove it is scoped.
+    """
+    prefix = docs_scope(url)
+    prefix_parts = [p for p in prefix.split("/") if p]
+    if not prefix_parts or not _VERSION.match(prefix_parts[-1]):
+        return None
+
+    body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
+    body = body.strip()
+    if llmsfinder.classify_llms_shape(body) not in ("index", "hybrid"):
+        return None
+
+    links = llmsfinder.parse_llms_links(body, det.url)
+    scoped = []
+    for title, link in links:
+        path = urlparse(link).path
+        path = path if path.endswith("/") else path + "/"
+        if path.startswith(prefix):
+            scoped.append((title, link))
+    return scoped or None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2272,32 +2387,61 @@ def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = Non
             # A site publishes one llms.txt for its current release. When the
             # caller asked for a specific version, handing them that file would
             # answer a question they did not ask — quietly, and with the wrong
-            # version. Crawl the version they named instead.
+            # version. If the manifest itself can prove which of its entries
+            # belong to that version, use just those; otherwise crawl the
+            # version they named instead.
+            restrict_links = None
+            skip_llms = False
             if _asks_for_a_version(url) and _probed_at_the_root(url, det):
+                skip_llms = True
+                if det.kind == "llms_txt":
+                    try:
+                        restrict_links = _llms_txt_version_scope(url, det, fetcher)
+                    except ForgeError:
+                        restrict_links = None
+                    if restrict_links is not None:
+                        skip_llms = False
+
+            if skip_llms:
                 _log(opts, "  ignoring the site-wide llms.txt: "
                            "the URL asks for one version of the docs")
             else:
+                if restrict_links is not None:
+                    _log(opts, f"  scoping the site-wide llms.txt to the requested "
+                               f"version ({len(restrict_links)} manifest page(s))")
                 _log(opts, f"  harvesting via {det.kind}")
-                if det.kind == "llms_txt":
-                    docs = handle_llms_txt(det, fetcher, opts, stats=stats)
-                else:
-                    docs = HANDLERS[det.kind](det, fetcher, opts)
-                _note_coverage(stats, det, docs, found=None)
+                try:
+                    if det.kind == "llms_txt":
+                        docs = handle_llms_txt(det, fetcher, opts, stats=stats,
+                                               restrict_links=restrict_links)
+                    else:
+                        docs = HANDLERS[det.kind](det, fetcher, opts)
+                except ForgeError as e:
+                    # The rung itself failed — an unreachable root document,
+                    # most often. That is a failure of this strategy, not of
+                    # the harvest: fall through to sitemap/crawl rather than
+                    # reporting nothing, or crashing outright.
+                    _log(opts, f"  {det.kind} acquisition failed ({e}); "
+                               f"falling back to the next strategy")
+                    docs = []
 
-                strategy_used = det.kind
-                if det.kind == "llms_txt":
-                    if det.url.lower().endswith(("llms-full.txt", "llms-medium.txt")):
-                        strategy_used = "llms-full.txt"
-                    elif docs:
-                        sample = docs[0].markdown if len(docs) == 1 else ""
-                        shape = llmsfinder.classify_llms_shape(sample)
-                        if len(docs) > 1 or shape == "index":
-                            has_md = any(llmsfinder.is_markdown_link(d.url) for d in docs)
-                            strategy_used = "llms.txt (md manifest)" if has_md else "llms.txt (html manifest)"
-                        else:
-                            strategy_used = "llms_txt"
+                if docs:
+                    _note_coverage(stats, det, docs, found=None)
 
-                return _drain(docs, sink), strategy_used
+                    strategy_used = det.kind
+                    if det.kind == "llms_txt":
+                        if det.url.lower().endswith(("llms-full.txt", "llms-medium.txt")):
+                            strategy_used = "llms-full.txt"
+                        elif docs:
+                            sample = docs[0].markdown if len(docs) == 1 else ""
+                            shape = llmsfinder.classify_llms_shape(sample)
+                            if len(docs) > 1 or shape == "index":
+                                has_md = any(llmsfinder.is_markdown_link(d.url) for d in docs)
+                                strategy_used = "llms.txt (md manifest)" if has_md else "llms.txt (html manifest)"
+                            else:
+                                strategy_used = "llms_txt"
+
+                    return _drain(docs, sink), strategy_used
 
         prefix = docs_scope(url) if opts.scope in ("", "section", None) else (
             "/" if opts.scope == "host" else opts.scope)
