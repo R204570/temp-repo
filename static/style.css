@@ -469,6 +469,89 @@ body {
   animation: spin 700ms linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+.spin.xs { width: 11px; height: 11px; border-width: 2px; }
+
+/* ── execution trace: what a tool call did underneath ────
+   Collapsed by default (Invariant: the compact view never changes just
+   because a trace exists); expanding opens a live SSE connection scoped to
+   that one tool call, see openTrace() in app.js. */
+.step-wrap { display: flex; flex-direction: column; gap: 4px; }
+.trace-toggle {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  margin: -4px -6px -4px 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.trace-toggle:hover { background: var(--surface-2); color: var(--text); }
+.trace-toggle .icon { transition: transform 120ms ease; }
+.trace-toggle[aria-expanded="true"] .icon { transform: rotate(180deg); }
+
+.trace-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 0 2px 12px;
+  padding: 8px 10px 8px 12px;
+  border-left: 2px solid var(--line-soft);
+  font-size: 12.5px;
+}
+.trace-empty { padding: 4px 0; color: var(--text-3); font-style: italic; }
+
+.trace-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+}
+.trace-row .mk { flex: 0 0 auto; display: grid; place-items: center; width: 14px; }
+.trace-row .icon.sm { width: 12px; height: 12px; }
+.trace-row.trace-completed .mk { color: var(--accent); }
+.trace-row.trace-failed .mk { color: var(--danger); }
+.trace-row.trace-skipped .mk,
+.trace-row.trace-cancelled .mk { color: var(--text-3); }
+
+.trace-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 8px;
+}
+.trace-body .nm { color: var(--text); font-weight: 500; }
+.trace-msg { color: var(--text-2); overflow-wrap: anywhere; }
+.trace-row.trace-failed .trace-msg { color: var(--danger); }
+.trace-target {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.trace-state {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.trace-row.trace-event { opacity: 0.9; }
+.trace-row.trace-event .trace-body { font-size: 12px; }
+
+.trace-children {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 2px 22px;
+  padding-left: 8px;
+  border-left: 1px dashed var(--line-soft);
+}
 
 .notice {
   padding: 9px 12px;

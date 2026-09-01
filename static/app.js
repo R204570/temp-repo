@@ -158,7 +158,176 @@ function blankScreen() {
   return blank;
 }
 
-function workRow(step) {
+// ── execution trace (the timeline inside one tool call) ──
+// A trace event's `id` is stable across re-emissions (a running stage
+// ticking its page count re-sends the same id) -- keeping one Map keyed on
+// that id, rather than an array, is what turns 360 progress ticks on a big
+// harvest into one row that updates instead of 360 rows that accumulate.
+const TRACE_STATE_LABEL = {
+  queued: "queued", running: "running", completed: "done",
+  failed: "failed", skipped: "skipped", cancelled: "cancelled",
+};
+
+function ensureTrace(step) {
+  if (!step.trace) {
+    step.trace = {
+      events: new Map(),   // id -> latest TraceEvent
+      order: [],           // ids, first-seen order
+      expanded: false,
+      status: "idle",      // idle | connecting | live | closed | error
+      source: null,        // the live EventSource, while connected
+      note: "",
+    };
+  }
+  return step.trace;
+}
+
+function closeTrace(tr) {
+  if (tr.source) {
+    tr.source.close();
+    tr.source = null;
+  }
+}
+
+/** Every EventSource any turn in the current conversation still has open.
+    Dropping the JS reference to a turn (switching chats, starting a new
+    one) does not close its connection on its own -- the browser keeps
+    streaming until told to stop, which would otherwise leak one open
+    connection per trace panel a user ever expanded. */
+function closeAllTraces() {
+  state.turns.forEach((t) => {
+    (t.steps || []).forEach((s) => {
+      if (s.trace) closeTrace(s.trace);
+    });
+  });
+}
+
+function openTrace(step, turn) {
+  const tr = ensureTrace(step);
+  if (tr.source || !step.traceId) return;
+  tr.status = "connecting";
+  let es;
+  try {
+    es = new EventSource(`/api/trace/${encodeURIComponent(step.traceId)}`);
+  } catch {
+    tr.status = "error";
+    tr.note = "Could not open a live connection.";
+    return;
+  }
+  tr.source = es;
+
+  es.addEventListener("trace", (e) => {
+    let data;
+    try {
+      data = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+    if (data.type === "heartbeat") return;
+    tr.status = "live";
+    if (!tr.events.has(data.id)) tr.order.push(data.id);
+    tr.events.set(data.id, data);
+    repaintStick(turn);
+  });
+  es.addEventListener("trace_error", (e) => {
+    try {
+      tr.note = JSON.parse(e.data).message || "This trace is no longer available.";
+    } catch {
+      tr.note = "This trace is no longer available.";
+    }
+    tr.status = "error";
+    closeTrace(tr);
+    repaintStick(turn);
+  });
+  es.addEventListener("trace_end", () => {
+    tr.status = "closed";
+    closeTrace(tr);
+    repaintStick(turn);
+  });
+  es.addEventListener("error", () => {
+    // A transport-level drop, not a `trace_error` from the server (that has
+    // its own listener above and already closes cleanly). EventSource
+    // retries on its own; reflect that rather than claiming the work itself
+    // stopped -- it may well still be running server-side.
+    if (tr.status !== "error" && tr.status !== "closed") {
+      tr.status = "reconnecting";
+      repaintStick(turn);
+    }
+  });
+}
+
+function traceRowLabel(ev) {
+  const bits = [ev.name || "(event)"];
+  if (ev.counters && ev.counters.pages) {
+    bits.push(ev.counters.expected
+      ? `${ev.counters.pages}/${ev.counters.expected} pages`
+      : `${ev.counters.pages} pages`);
+  }
+  return bits.join(" — ");
+}
+
+function traceRow(ev) {
+  const row = el("div", `trace-row trace-${ev.state} trace-${ev.type}`);
+  const mk = el("span", "mk");
+  if (ev.state === "running") {
+    const s = el("div", "spin xs");
+    s.setAttribute("aria-hidden", "true");
+    mk.append(s);
+  } else {
+    const glyph = { completed: "i-tick", failed: "i-bang", skipped: "i-bang",
+                    cancelled: "i-bang", queued: "i-bang" }[ev.state] || "i-tick";
+    mk.append(icon(glyph, "sm"));
+  }
+  row.append(mk);
+
+  const body = el("div", "trace-body");
+  body.append(el("span", "nm", traceRowLabel(ev)));
+  const msg = ev.state === "failed" ? (ev.error || ev.message) : ev.message;
+  if (msg) body.append(el("span", "trace-msg", msg));
+  if (ev.target) body.append(el("span", "trace-target", ev.target));
+  row.append(body);
+
+  const state = el("span", "trace-state", TRACE_STATE_LABEL[ev.state] || ev.state);
+  row.append(state);
+  return row;
+}
+
+function renderTracePanel(step) {
+  const tr = step.trace;
+  const panel = el("div", "trace-panel");
+  if (!tr.order.length) {
+    const waiting = tr.status === "error"
+      ? (tr.note || "This trace is no longer available.")
+      : "Waiting for the first event…";
+    panel.append(el("div", "trace-empty", waiting));
+    return panel;
+  }
+  // Root-level rows (no parent) carry the stages; a stage's own children are
+  // nested directly under it, one level deep -- enough to show Turn -> tool
+  // call -> stage -> event without building a general tree view for a
+  // hierarchy that is never more than four levels deep in practice.
+  const byParent = new Map();
+  tr.order.forEach((id) => {
+    const ev = tr.events.get(id);
+    const key = ev.parent_id || "";
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(ev);
+  });
+  const roots = byParent.get("") || [];
+  roots.forEach((ev) => {
+    panel.append(traceRow(ev));
+    const children = byParent.get(ev.id) || [];
+    if (children.length) {
+      const nested = el("div", "trace-children");
+      children.forEach((child) => nested.append(traceRow(child)));
+      panel.append(nested);
+    }
+  });
+  if (tr.status === "reconnecting") panel.append(el("div", "trace-empty", "Reconnecting…"));
+  return panel;
+}
+
+function workRow(step, turn) {
   const row = el("div", `step ${step.running ? "run" : step.ok ? "ok" : "bad"}`);
   if (step.running) {
     const s = el("div", "spin");
@@ -181,7 +350,29 @@ function workRow(step) {
     if (step.chars) bits.push(bytes(step.chars));
     if (bits.length) row.append(el("span", "sz", bits.join(" · ")));
   }
-  return row;
+
+  if (!step.running && step.traceId) {
+    const tr = ensureTrace(step);
+    const toggle = el("button", "trace-toggle");
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", String(tr.expanded));
+    toggle.setAttribute("aria-label", tr.expanded ? "Hide details" : "Show details");
+    toggle.append(icon("i-chev", "sm"));
+    toggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      tr.expanded = !tr.expanded;
+      if (tr.expanded) openTrace(step, turn);
+      repaintStick(turn);
+    });
+    row.append(toggle);
+  }
+
+  const wrap = el("div", "step-wrap");
+  wrap.append(row);
+  if (!step.running && step.traceId && step.trace && step.trace.expanded) {
+    wrap.append(renderTracePanel(step));
+  }
+  return wrap;
 }
 
 function actionsFor(t) {
@@ -257,7 +448,7 @@ function renderTurn(t) {
 
   if (t.steps.length) {
     const work = el("div", "work");
-    t.steps.forEach((s) => work.append(workRow(s)));
+    t.steps.forEach((s) => work.append(workRow(s, t)));
     reply.append(work);
   }
   t.notices.forEach((m) => reply.append(el("div", "notice", m)));
@@ -314,16 +505,33 @@ function render() {
   titleEl.textContent = state.turns[state.turns.length - 1].title;
 }
 
-/** While streaming, only the tail changes — repainting the whole thread
-    would throw away the user's scroll position on every token. */
-function paintTail() {
-  const t = state.turns[state.turns.length - 1];
+/** Repaint one turn in place — replacing the whole thread would throw away
+    the user's scroll position on every token, and (for a trace update) on
+    every stage tick of a harvest that may still be running minutes later. */
+function repaintTurn(t) {
   if (!t) return;
   const node = turnsEl.querySelector(`[data-turn="${t.id}"]`);
   if (!node) return render();
   const fresh = renderTurn(t);
   fresh.style.animation = "none";
   node.replaceWith(fresh);
+}
+
+/** Same, but only for whichever turn is still streaming — the common case,
+    and the only one that used to exist before trace panels could update a
+    turn other than the last one. */
+function paintTail() {
+  repaintTurn(state.turns[state.turns.length - 1]);
+}
+
+/** Repaint a specific turn, preserving scroll position the same way the
+    main stream loop already does: stick to the bottom only if already
+    there, so a user reading history is never yanked down by a background
+    harvest's trace tick. */
+function repaintStick(t) {
+  const stick = atBottom();
+  repaintTurn(t);
+  if (stick) scrollDown(true);
 }
 
 // ── files ────────────────────────────────────────────────
@@ -512,6 +720,7 @@ async function ask(question) {
               s.ok = data.ok;
               s.chars = data.chars;
               s.kind = data.kind || "";
+              s.traceId = data.trace_id || null;
             }
             setFoot("Reading…");
           }
@@ -608,7 +817,15 @@ function persist() {
       markdown: t.markdown,
       authored: t.authored,
       title: t.title,
-      steps: t.steps,
+      // Conversation history and execution telemetry are different things:
+      // keep the trace id so a same-session reload can still open the live
+      // panel, drop the accumulated events (and the live EventSource, which
+      // is not serialisable at all) so chat history does not grow with
+      // every page a harvest touched.
+      steps: t.steps.map((s) => ({
+        name: s.name, args: s.args, running: s.running, ok: s.ok,
+        chars: s.chars, kind: s.kind, traceId: s.traceId || null,
+      })),
       notices: t.notices,
       provider: t.provider,
       model: t.model,
@@ -649,6 +866,7 @@ async function restore(chat) {
 function newChat() {
   if (state.busy) return;
   persist();
+  closeAllTraces();
   state.chatId = newId();
   state.turns = [];
   history.replaceState(null, "", "/");
@@ -661,6 +879,7 @@ function openChat(id) {
   if (state.busy) return;
   if (id === state.chatId) return;
   persist();
+  closeAllTraces();
   const chat = Sidebar.read().find((c) => c.id === id);
   if (chat) restore(chat);
 }
@@ -706,6 +925,7 @@ Sidebar.onOpenChat = openChat;
 // sensible rather than on a transcript that no longer exists anywhere.
 document.addEventListener("chats:changed", (e) => {
   if (e.detail && e.detail.id === state.chatId) {
+    closeAllTraces();
     state.chatId = newId();
     state.turns = [];
     render();
@@ -714,7 +934,10 @@ document.addEventListener("chats:changed", (e) => {
 });
 
 // Leaving mid-conversation should not lose it.
-window.addEventListener("beforeunload", persist);
+window.addEventListener("beforeunload", () => {
+  persist();
+  closeAllTraces();
+});
 
 const wanted = new URLSearchParams(location.search).get("chat");
 const saved = wanted && Sidebar.read().find((c) => c.id === wanted);
