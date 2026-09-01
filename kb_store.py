@@ -1016,10 +1016,19 @@ class PostgresStore:
             tech_name, ver, ord_num, p_title, p_url, snippet, rank_val, heading_path, page_count = r
             if page_count == 1 and heading_path:
                 display_title = f"{p_title} > {heading_path}" if p_title and p_title != heading_path else heading_path
-                dedup_key = (p_url, heading_path)
             else:
                 display_title = p_title
-                dedup_key = p_url
+
+            # Always by URL. A single-page corpus can match through the page's
+            # own index *and* through one of its sections — the `page` and
+            # `section` branches of `hit` above are redundant coverage of the
+            # same document, not two different documents — so keying on
+            # `(url, heading_path)` let the page-level row (heading_path='')
+            # and its own lead section (heading_path=title) survive as two
+            # results for one match. Rows already arrive rank-ordered, so
+            # deduping on the URL alone keeps the best-ranked one and still
+            # shows its heading-qualified title.
+            dedup_key = p_url
 
             if dedup_key in seen:
                 continue
