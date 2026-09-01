@@ -337,7 +337,11 @@ def _decode(r: requests.Response) -> str:
     UTF-8 docs. Fall back to content sniffing when the server didn't say."""
     ctype = r.headers.get("content-type", "").lower()
     if "charset=" not in ctype:
-        r.encoding = r.apparent_encoding or "utf-8"
+        encoding = getattr(r, "apparent_encoding", None) or "utf-8"
+        try:
+            r.encoding = encoding
+        except (AttributeError, TypeError):
+            pass
     return r.text
 
 
@@ -851,7 +855,8 @@ def _split_dump(text: str, above: int = SPLIT_ABOVE) -> list[tuple[str, str]]:
     return parts
 
 
-def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options) -> list[Doc]:
+def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
+                    stats: dict | None = None) -> list[Doc]:
     body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
     body = body.strip()
 
@@ -860,43 +865,94 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options) -> list[Doc
     if shape == "index":
         links = llmsfinder.parse_llms_links(body, det.url)
         if links:
+            expected_count = len(links)
             docs: list[Doc] = []
+            failed_urls: list[tuple[str, str]] = []
+
             for title, link_url in links:
                 if llmsfinder.is_markdown_link(link_url):
                     try:
                         text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
                         docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
-                    except ForgeError:
-                        continue
+                    except Exception as e:
+                        failed_urls.append((link_url, str(e)))
                 else:
                     try:
                         doc_title, md = _extract_page(link_url, fetcher, opts)
                         docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
-                    except ForgeError:
-                        continue
+                    except Exception as e:
+                        failed_urls.append((link_url, str(e)))
+
+            acquired_count = len(docs)
+            failed_count = len(failed_urls)
+            is_whole = (acquired_count == expected_count and expected_count > 0)
+
+            if stats is not None:
+                stats["expected"] = expected_count
+                stats["discovered"] = expected_count
+                stats["acquired"] = acquired_count
+                stats["fetched"] = acquired_count
+                stats["failed"] = failed_count
+                stats["whole"] = is_whole
+                if not is_whole:
+                    stats["reason"] = (
+                        f"manifest declared {expected_count} unique pages, but {failed_count} "
+                        f"could not be acquired"
+                    )
+
             if docs:
-                _log(opts, f"  harvested {len(docs)} pages from llms.txt index manifest")
+                _log(opts, f"  harvested {len(docs)}/{expected_count} pages from llms.txt index manifest")
                 return docs
 
     if shape == "hybrid":
-        docs = [Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)]
+        root_doc = Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)
         links = llmsfinder.parse_llms_links(body, det.url)
+        expected_count = len(links)
+        acquired_docs: list[Doc] = []
+        failed_urls: list[tuple[str, str]] = []
+
         for title, link_url in links:
             if llmsfinder.is_markdown_link(link_url):
                 try:
                     text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
-                    docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
-                except ForgeError:
-                    continue
+                    acquired_docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
+                except Exception as e:
+                    failed_urls.append((link_url, str(e)))
             else:
                 try:
                     doc_title, md = _extract_page(link_url, fetcher, opts)
-                    docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
-                except ForgeError:
-                    continue
-        return docs
+                    acquired_docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
+                except Exception as e:
+                    failed_urls.append((link_url, str(e)))
+
+        acquired_count = len(acquired_docs)
+        failed_count = len(failed_urls)
+        is_whole = (acquired_count == expected_count and expected_count > 0)
+
+        if stats is not None:
+            stats["expected"] = expected_count
+            stats["discovered"] = expected_count + 1
+            stats["acquired"] = acquired_count
+            stats["fetched"] = acquired_count + 1
+            stats["failed"] = failed_count
+            stats["whole"] = is_whole
+            if not is_whole:
+                stats["reason"] = (
+                    f"hybrid root document stored, but {failed_count} of {expected_count} "
+                    f"manifest linked pages could not be acquired"
+                )
+
+        return [root_doc] + acquired_docs
 
     # Shape B (dump): content is stored whole as one Markdown document.
+    if stats is not None:
+        stats["expected"] = 1
+        stats["discovered"] = 1
+        stats["acquired"] = 1
+        stats["fetched"] = 1
+        stats["failed"] = 0
+        stats["whole"] = True
+
     return [Doc(det.url, "llms.txt", _meta_header(det.url, "llms.txt") + body)]
 
 
@@ -2158,42 +2214,38 @@ _NAMES_A_FULLER_FILE = re.compile(r"llms-(full|medium)\.txt", re.I)
 
 def _note_coverage(stats: dict | None, det: "Detection", docs: list,
                    found: "DocMap | None" = None) -> None:
-    """Record whether this harvest actually got the whole documentation.
-
-    `whole` is three-valued on purpose. `True` is a claim we can defend, `False`
-    is a known gap, and `None` means nobody counted — which must never be
-    presented to a model as if it were `True`.
-    """
+    """Record whether this harvest actually got the whole documentation."""
     if stats is None:
         return
-    whole: bool | None
-    if det.kind == "llms_txt":
-        body = "\n".join(d.markdown for d in docs)[:200_000]
-        is_unfetched_index = (
-            len(docs) == 1
-            and det.url.lower().endswith("llms.txt")
-            and _NAMES_A_FULLER_FILE.search(body)
-            and llmsfinder.classify_llms_shape(body) == "index"
-        )
-        whole = not is_unfetched_index
-        if not whole:
-            missing = found.dump_bytes if found else 0
-            stats["reason"] = (
-                "stored an llms.txt index that names a fuller file which could "
-                "not be fetched"
-                + (f" ({missing:,} characters of it)" if missing else ""))
-    else:
-        # A spec, a single file, or a repository's Markdown tree: each is
-        # enumerated in full by its handler.
-        whole = True
-    stats["whole"] = whole
+    if "whole" not in stats:
+        if det.kind == "llms_txt":
+            body = "\n".join(d.markdown for d in docs)[:200_000]
+            is_unfetched_index = (
+                len(docs) == 1
+                and det.url.lower().endswith("llms.txt")
+                and _NAMES_A_FULLER_FILE.search(body)
+                and llmsfinder.classify_llms_shape(body) == "index"
+            )
+            stats["whole"] = not is_unfetched_index
+            if not stats["whole"] and "reason" not in stats:
+                missing = found.dump_bytes if found else 0
+                stats["reason"] = (
+                    "stored an llms.txt index that names a fuller file which could "
+                    "not be fetched"
+                    + (f" ({missing:,} characters of it)" if missing else ""))
+        else:
+            stats["whole"] = True
+
     if found is not None:
         stats["map"] = found.as_dict()
-        # What the site says it has beats how many pieces we happened to cut
-        # its dump into. Only fall back to our own count when nobody could say.
-        stats.setdefault("discovered", found.expected or len(docs))
+        stats.setdefault("discovered", found.expected or stats.get("expected") or len(docs))
+        stats.setdefault("expected", found.expected or stats.get("expected") or len(docs))
     else:
-        stats.setdefault("discovered", len(docs))
+        stats.setdefault("discovered", stats.get("expected") or len(docs))
+        stats.setdefault("expected", len(docs))
+
+    stats.setdefault("acquired", len(docs))
+    stats.setdefault("fetched", len(docs))
 
 
 def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = None,
@@ -2226,9 +2278,11 @@ def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = Non
                            "the URL asks for one version of the docs")
             else:
                 _log(opts, f"  harvesting via {det.kind}")
-                docs = HANDLERS[det.kind](det, fetcher, opts)
-                found = discover(url, fetcher, opts) if stats is not None else None
-                _note_coverage(stats, det, docs, found)
+                if det.kind == "llms_txt":
+                    docs = handle_llms_txt(det, fetcher, opts, stats=stats)
+                else:
+                    docs = HANDLERS[det.kind](det, fetcher, opts)
+                _note_coverage(stats, det, docs, found=None)
 
                 strategy_used = det.kind
                 if det.kind == "llms_txt":

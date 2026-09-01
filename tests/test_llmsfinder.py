@@ -3,7 +3,8 @@ Tests for LLMSFinder implementation (llmsfinder.md).
 
 Tests shape classification, link extraction, acquisition ladder progression,
 single-document whole storage, section-level search on single documents,
-and disclosed truncation headers.
+disclosed truncation headers, manifest completeness failure tracking,
+duplicate link deduplication, hybrid partial failures, and non-redundant discovery.
 """
 
 import os
@@ -116,8 +117,8 @@ def test_handle_llms_txt_stores_dump_whole(tmp_path):
     assert "Section 49" in docs[0].markdown
 
 
-# ── 4. Rung 2: Markdown Index Manifest Harvesting ──────────
-def test_harvest_md_manifest_index():
+# ── 4. Manifest Complete Success vs Partial Failure ───────
+def test_manifest_complete_success():
     index_body = "# Index\n\n" + "\n".join(
         f"- [Page {i}](https://x.dev/p{i}.md)" for i in range(5)
     )
@@ -131,10 +132,137 @@ def test_harvest_md_manifest_index():
 
     assert strat == "llms.txt (md manifest)"
     assert len(docs) == 5
-    assert stats.get("whole") is True
+    assert stats["expected"] == 5
+    assert stats["acquired"] == 5
+    assert stats["failed"] == 0
+    assert stats["whole"] is True
 
 
-# ── 5. Section Search on Single-Document Corpus ───────────
+def test_manifest_partial_failure():
+    index_body = "# Index\n\n" + "\n".join(
+        f"- [Page {i}](https://x.dev/p{i}.md)" for i in range(5)
+    )
+    pages = {"https://x.dev/llms.txt": FakeResponse(index_body, ctype="text/plain")}
+    # Only 4 of 5 pages exist, p4.md will 404
+    for i in range(4):
+        pages[f"https://x.dev/p{i}.md"] = FakeResponse(f"# Page {i}\nContent {i}", ctype="text/plain")
+
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    docs, strat = df.harvest("https://x.dev/llms.txt", fetcher=fetcher, stats=stats)
+
+    assert strat == "llms.txt (md manifest)"
+    assert len(docs) == 4
+    assert stats["expected"] == 5
+    assert stats["acquired"] == 4
+    assert stats["failed"] == 1
+    assert stats["whole"] is False
+    assert "manifest declared 5 unique pages" in stats.get("reason", "")
+
+
+def test_duplicate_manifest_links():
+    index_body = """# Index
+- [Page 0](https://x.dev/p0.md)
+- [Page 1](https://x.dev/p1.md)
+- [Page 0 Repeat](https://x.dev/p0.md#section)
+- [Page 2](https://x.dev/p2.md)
+- [Page 1 Repeat](https://x.dev/p1.md)
+"""
+    pages = {
+        "https://x.dev/llms.txt": FakeResponse(index_body, ctype="text/plain"),
+        "https://x.dev/p0.md": FakeResponse("# P0", ctype="text/plain"),
+        "https://x.dev/p1.md": FakeResponse("# P1", ctype="text/plain"),
+        "https://x.dev/p2.md": FakeResponse("# P2", ctype="text/plain"),
+    }
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    docs, _strat = df.harvest("https://x.dev/llms.txt", fetcher=fetcher, stats=stats)
+
+    # 5 link lines, but only 3 unique clean URLs
+    assert stats["expected"] == 3
+    assert stats["acquired"] == 3
+    assert len(docs) == 3
+    assert stats["whole"] is True
+
+
+def test_hybrid_partial_failure():
+    hybrid_body = (
+        "# Overview\n\nMain prose overview text here.\n\n"
+        + ("Additional explanatory prose content. " * 30) + "\n\n"
+        + "- [Doc 0](https://x.dev/d0.md)\n"
+        + "- [Doc 1](https://x.dev/d1.md)\n"
+        + "- [Doc 2](https://x.dev/d2.md)\n"
+    )
+    pages = {
+        "https://x.dev/llms.txt": FakeResponse(hybrid_body, ctype="text/plain"),
+        "https://x.dev/d0.md": FakeResponse("# D0", ctype="text/plain"),
+        # d1.md fails
+        "https://x.dev/d2.md": FakeResponse("# D2", ctype="text/plain"),
+    }
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    docs, _strat = df.harvest("https://x.dev/llms.txt", fetcher=fetcher, stats=stats)
+
+    # Root doc stored + 2 acquired linked docs = 3 docs
+    assert len(docs) == 3
+    assert stats["expected"] == 3
+    assert stats["acquired"] == 2
+    assert stats["failed"] == 1
+    assert stats["whole"] is False
+    assert "hybrid root document stored" in stats.get("reason", "")
+
+
+def test_malformed_links_handling():
+    text = """# Docs
+- [Valid](https://x.dev/valid.md)
+- [Invalid JS](javascript:alert(1))
+- [Bad Scheme](invalid-scheme://bad)
+- [Another Valid](https://x.dev/another.md)
+"""
+    links = llmsfinder.parse_llms_links(text, "https://x.dev/llms.txt")
+    urls = [url for _t, url in links]
+    assert "https://x.dev/valid.md" in urls
+    assert "https://x.dev/another.md" in urls
+    assert len(links) == 2  # Malformed links safely excluded
+
+
+# ── 5. Full Dump Discovery & Non-Redundant Probing ─────────
+def test_full_dump_discovery_from_nested_url():
+    pages = {
+        "https://x.dev/llms-full.txt": FakeResponse("# Complete Docs Dump\n" + ("prose " * 400), ctype="text/plain"),
+        "https://x.dev/docs/sub/page.html": FakeResponse("<html><body><p>Nested</p></body></html>"),
+    }
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    docs, strat = df.harvest("https://x.dev/docs/sub/page.html", fetcher=fetcher, stats=stats)
+
+    assert strat == "llms-full.txt"
+    assert len(docs) == 1
+    assert docs[0].url == "https://x.dev/llms-full.txt"
+    assert stats["whole"] is True
+
+
+def test_no_unnecessary_post_success_discovery():
+    dump_text = "# Complete Docs Dump\n\n" + ("Full documentation text. " * 100)
+    pages = {
+        "https://x.dev/llms-full.txt": FakeResponse(dump_text, ctype="text/plain"),
+    }
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    docs, strat = df.harvest("https://x.dev/llms-full.txt", fetcher=fetcher, stats=stats)
+
+    assert strat == "llms-full.txt"
+    assert len(docs) == 1
+
+    # Verify FakeFetcher only asked for llms-full.txt and zero sitemaps or robots.txt
+    asked_urls = fetcher.asked
+    assert len(asked_urls) == 1
+    assert asked_urls[0] == "https://x.dev/llms-full.txt"
+    assert not any("sitemap" in u for u in asked_urls)
+    assert not any("robots" in u for u in asked_urls)
+
+
+# ── 6. Section Search on Single-Document Corpus ───────────
 def test_file_store_section_search_on_single_doc(tmp_path):
     store = kbs.FileStore(tmp_path)
     body = (
@@ -152,7 +280,7 @@ def test_file_store_section_search_on_single_doc(tmp_path):
     assert any("Section B" in t for t in titles)
 
 
-# ── 6. Disclosed Truncation in read_knowledge_base ─────────
+# ── 7. Disclosed Truncation in read_knowledge_base ─────────
 def test_read_knowledge_base_discloses_omission(tmp_path, monkeypatch):
     monkeypatch.setattr(ft, "store", lambda: kbs.FileStore(tmp_path))
     monkeypatch.setattr(ft, "MAX_CHARS", 100)

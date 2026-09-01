@@ -66,7 +66,14 @@ def parse_llms_links(text: str, base_url: str) -> list[tuple[str, str]]:
         target = target.strip()
         if not target or target.startswith(("#", "mailto:", "javascript:")):
             continue
-        full_url = urljoin(base_url, target)
+        try:
+            full_url = urljoin(base_url, target)
+            p = urlparse(full_url)
+            if p.scheme not in ("http", "https") or not p.netloc:
+                continue
+        except Exception:
+            continue
+
         # Strip fragment for document fetching deduplication
         clean_url = full_url.split("#")[0]
         if clean_url in seen:
