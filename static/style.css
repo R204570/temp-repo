@@ -476,6 +476,14 @@ body {
    because a trace exists); expanding opens a live SSE connection scoped to
    that one tool call, see openTrace() in app.js. */
 .step-wrap { display: flex; flex-direction: column; gap: 4px; }
+
+/* A step that has a trace behind it is a control: the whole row opens it. */
+.step.openable { cursor: pointer; }
+.step.openable:hover { background: var(--surface-2); border-color: var(--line); }
+.step.openable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .trace-toggle {
   flex: 0 0 auto;
   display: grid;
@@ -483,15 +491,11 @@ body {
   width: 22px;
   height: 22px;
   margin: -4px -6px -4px 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
   color: var(--text-3);
-  cursor: pointer;
 }
-.trace-toggle:hover { background: var(--surface-2); color: var(--text); }
 .trace-toggle .icon { transition: transform 120ms ease; }
-.trace-toggle[aria-expanded="true"] .icon { transform: rotate(180deg); }
+.step[aria-expanded="true"] .trace-toggle .icon { transform: rotate(180deg); }
+.step[aria-expanded="true"] .trace-toggle { color: var(--text); }
 
 .trace-panel {
   display: flex;
@@ -544,6 +548,8 @@ body {
 .trace-row.trace-event { opacity: 0.9; }
 .trace-row.trace-event .trace-body { font-size: 12px; }
 
+.trace-node { display: flex; flex-direction: column; gap: 2px; }
+
 .trace-children {
   display: flex;
   flex-direction: column;
@@ -552,6 +558,56 @@ body {
   padding-left: 8px;
   border-left: 1px dashed var(--line-soft);
 }
+
+/* ── what went in, and what came back ──────────────────── */
+.trace-label {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.trace-args {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 2px 22px;
+  min-width: 0;
+}
+.trace-args code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.trace-output { margin: 2px 0 6px 22px; }
+.trace-output-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.trace-omitted { font-size: 11px; color: var(--text-3); }
+.trace-output pre {
+  margin: 0;
+  /* Bounded on purpose: a 20,000-character tool result must not push the
+     answer it produced off the screen. It scrolls; it does not take over. */
+  max-height: 260px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.trace-row.trace-failed ~ .trace-output pre { border-color: rgba(255, 154, 154, 0.34); }
 
 .notice {
   padding: 9px 12px;
