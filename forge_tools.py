@@ -1766,15 +1766,32 @@ def openai_tools() -> list[dict]:
     ]
 
 
+#: Argument names worth showing as the headline "what this acted on", in
+#: the order a reader would want them. Everything else still travels in the
+#: event's metadata; this only decides what the one-line summary says.
+_TARGET_KEYS = ("url", "name", "query", "technology", "section", "path", "out_dir")
+
+
+def _target_of(arguments: dict) -> str:
+    for key in _TARGET_KEYS:
+        value = (arguments or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def run_tool(name: str, arguments: dict[str, Any]) -> str:
     """Dispatch a tool call. Errors come back as text so a model can recover
     from them rather than the whole turn dying.
 
-    Every call gets a trace, whether or not the tool underneath actually
-    reports anything into it: an untraced tool's Trace simply stays empty,
-    which is a truthful (if uninteresting) execution timeline rather than a
-    missing one. What varies is only whether `tool.fn` was written to fill
-    it in -- see `_TRACED`.
+    Every call is wrapped in one root trace stage recording what was asked
+    (the arguments, sanitized) and what came back (the tool's own returned
+    text, bounded). That happens for *every* tool, not only the handful
+    that report their own internal stages -- a tool nobody has instrumented
+    still answers "what ran, and what did it return", which is the whole
+    question the detail view exists for. Tools that do report internals
+    (see `_TRACED`) are handed a context parented to this stage, so their
+    stages nest underneath it rather than floating beside it.
     """
     tool = BY_NAME.get(name)
     if tool is None:
@@ -1783,13 +1800,30 @@ def run_tool(name: str, arguments: dict[str, Any]) -> str:
     ctx = tracing.start(name)
     _last_trace.value = ctx.trace_id
     started = time.perf_counter()
+
+    allowed = set((tool.schema.get("properties") or {}).keys())
+    kwargs = {k: v for k, v in (arguments or {}).items() if k in allowed}
+    call = ctx.stage(name, target=_target_of(kwargs), metadata=dict(kwargs))
+    inner = call.start(f"called {name}")
+
     try:
-        allowed = set((tool.schema.get("properties") or {}).keys())
-        kwargs = {k: v for k, v in (arguments or {}).items() if k in allowed}
         if name in _TRACED:
-            kwargs["trace"] = ctx
+            kwargs["trace"] = inner
         result = tool.fn(**kwargs)
         duration_ms = (time.perf_counter() - started) * 1000
+        # A detached trace means the call returned but the work did not stop
+        # -- a harvest past its deadline, still running on its own thread and
+        # still filling in the child stages below this one. Saying "returned
+        # N characters" and nothing else would read as finished.
+        still_running = ctx.is_detached()
+        summary = f"returned {len(result):,} characters in {duration_ms / 1000:.1f}s"
+        call.finish(tracing.COMPLETED,
+                    message=(f"{summary} — work continues in the background"
+                            if still_running else summary),
+                    result={"characters": len(result),
+                           "seconds": round(duration_ms / 1000, 2),
+                           "still_running": still_running},
+                    output=result)
         try:
             applog.tool_call(name, ok=True, duration_ms=duration_ms,
                              trace_id=ctx.trace_id, chars=len(result))
@@ -1797,11 +1831,13 @@ def run_tool(name: str, arguments: dict[str, Any]) -> str:
             pass
         return result
     except ForgeError as e:
-        return _tool_error(name, ctx, started, f"Error: {e}", str(e))
+        return _tool_error(name, ctx, call, started, f"Error: {e}", str(e))
     except TypeError as e:
-        return _tool_error(name, ctx, started, f"Error: bad arguments for {name}: {e}", str(e))
+        return _tool_error(name, ctx, call, started,
+                          f"Error: bad arguments for {name}: {e}", str(e))
     except Exception as e:  # a scrape can fail in a hundred ways
-        return _tool_error(name, ctx, started, f"Error: {type(e).__name__}: {e}", str(e))
+        return _tool_error(name, ctx, call, started,
+                          f"Error: {type(e).__name__}: {e}", str(e))
     finally:
         # A tool whose real work continues past this call (a harvest still
         # running on a background thread) calls `ctx.detach()` before
@@ -1812,9 +1848,14 @@ def run_tool(name: str, arguments: dict[str, Any]) -> str:
             ctx.close()
 
 
-def _tool_error(name: str, ctx: "tracing.TraceContext", started: float,
-                message: str, detail: str) -> str:
-    ctx.event("tool failed", state=tracing.FAILED, error=detail)
+def _tool_error(name: str, ctx: "tracing.TraceContext", call: "tracing.Stage",
+                started: float, message: str, detail: str) -> str:
+    # The failure is recorded against the call that actually failed, and the
+    # text the model was handed is stored as its output -- a failed tool
+    # call still produced a result, and hiding it would leave the detail
+    # view unable to answer "what came back" for exactly the calls where
+    # that question matters most.
+    call.finish(tracing.FAILED, error=detail, output=message)
     duration_ms = (time.perf_counter() - started) * 1000
     try:
         applog.tool_call(name, ok=False, duration_ms=duration_ms,

@@ -266,6 +266,39 @@ function traceRowLabel(ev) {
   return bits.join(" — ");
 }
 
+/** The arguments an operation was called with, as one readable line.
+    This is the "what was executed" half of the question. */
+function traceArgs(meta) {
+  const entries = Object.entries(meta || {}).filter(
+    ([, v]) => v !== null && v !== undefined && v !== "" && v !== false);
+  if (!entries.length) return null;
+  const text = entries
+    .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join("  ·  ");
+  const line = el("div", "trace-args");
+  line.append(el("span", "trace-label", "input"));
+  line.append(el("code", null, text));
+  return line;
+}
+
+/** What the operation returned. Rendered as text rather than parsed as
+    Markdown: this view exists to show exactly what the model was handed,
+    and rendering it would be showing something else. */
+function traceOutput(ev) {
+  if (!ev.output) return null;
+  const box = el("div", "trace-output");
+  const head = el("div", "trace-output-head");
+  head.append(el("span", "trace-label", ev.state === "failed" ? "error output" : "output"));
+  if (ev.omitted) {
+    head.append(el("span", "trace-omitted",
+      `showing the first ${ev.output.length.toLocaleString()} characters, ` +
+      `${ev.omitted.toLocaleString()} more omitted`));
+  }
+  box.append(head);
+  box.append(el("pre", null, ev.output));
+  return box;
+}
+
 function traceRow(ev) {
   const row = el("div", `trace-row trace-${ev.state} trace-${ev.type}`);
   const mk = el("span", "mk");
@@ -292,6 +325,28 @@ function traceRow(ev) {
   return row;
 }
 
+/** One operation and everything beneath it. Recursive rather than the two
+    fixed levels this started with: a tool call now owns its own stages,
+    which own their own events, so the depth is data rather than a
+    constant. */
+function traceNode(ev, byParent, depth) {
+  const node = el("div", "trace-node");
+  node.append(traceRow(ev));
+
+  const args = traceArgs(ev.metadata);
+  if (args) node.append(args);
+  const out = traceOutput(ev);
+  if (out) node.append(out);
+
+  const children = byParent.get(ev.id) || [];
+  if (children.length) {
+    const nested = el("div", "trace-children");
+    children.forEach((child) => nested.append(traceNode(child, byParent, depth + 1)));
+    node.append(nested);
+  }
+  return node;
+}
+
 function renderTracePanel(step) {
   const tr = step.trace;
   const panel = el("div", "trace-panel");
@@ -302,10 +357,9 @@ function renderTracePanel(step) {
     panel.append(el("div", "trace-empty", waiting));
     return panel;
   }
-  // Root-level rows (no parent) carry the stages; a stage's own children are
-  // nested directly under it, one level deep -- enough to show Turn -> tool
-  // call -> stage -> event without building a general tree view for a
-  // hierarchy that is never more than four levels deep in practice.
+  // Index by parent, then render from the roots down. A tool call is its
+  // own root row, its stages hang beneath it, and their events beneath
+  // those -- so the depth comes from the data rather than being fixed here.
   const byParent = new Map();
   tr.order.forEach((id) => {
     const ev = tr.events.get(id);
@@ -313,15 +367,8 @@ function renderTracePanel(step) {
     if (!byParent.has(key)) byParent.set(key, []);
     byParent.get(key).push(ev);
   });
-  const roots = byParent.get("") || [];
-  roots.forEach((ev) => {
-    panel.append(traceRow(ev));
-    const children = byParent.get(ev.id) || [];
-    if (children.length) {
-      const nested = el("div", "trace-children");
-      children.forEach((child) => nested.append(traceRow(child)));
-      panel.append(nested);
-    }
+  (byParent.get("") || []).forEach((ev) => {
+    panel.append(traceNode(ev, byParent, 0));
   });
   if (tr.status === "reconnecting") panel.append(el("div", "trace-empty", "Reconnecting…"));
   return panel;
@@ -352,19 +399,35 @@ function workRow(step, turn) {
   }
 
   if (!step.running && step.traceId) {
+    // The whole row is the control, not just the chevron. A 22px target at
+    // the end of the row is findable only if you already know it is there,
+    // and "what did this tool actually do" is the first question a reader
+    // has -- so clicking anywhere on the row answers it. The chevron stays
+    // as the affordance that says the row opens at all.
     const tr = ensureTrace(step);
-    const toggle = el("button", "trace-toggle");
-    toggle.type = "button";
-    toggle.setAttribute("aria-expanded", String(tr.expanded));
-    toggle.setAttribute("aria-label", tr.expanded ? "Hide details" : "Show details");
-    toggle.append(icon("i-chev", "sm"));
-    toggle.addEventListener("click", (e) => {
-      e.stopPropagation();
+    const toggle = () => {
       tr.expanded = !tr.expanded;
       if (tr.expanded) openTrace(step, turn);
       repaintStick(turn);
+    };
+
+    row.classList.add("openable");
+    row.setAttribute("role", "button");
+    row.setAttribute("tabindex", "0");
+    row.setAttribute("aria-expanded", String(tr.expanded));
+    row.title = tr.expanded ? "Hide what this ran" : "Show what this ran and what it returned";
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
     });
-    row.append(toggle);
+
+    const chev = el("span", "trace-toggle");
+    chev.setAttribute("aria-hidden", "true");
+    chev.append(icon("i-chev", "sm"));
+    row.append(chev);
   }
 
   const wrap = el("div", "step-wrap");

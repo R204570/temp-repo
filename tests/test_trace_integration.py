@@ -62,20 +62,92 @@ def by_name(trace, name):
     return matches[-1]
 
 
-# ── run_tool(): every call gets a trace, closed when it returns ──
-def test_run_tool_traces_an_untraced_tool_as_an_empty_but_real_trace():
-    ft.run_tool("detect_source_type", {"url": "not a url"})
+# ── run_tool(): EVERY call records what ran and what came back ──
+def test_an_uninstrumented_tool_still_records_its_arguments_and_output(monkeypatch):
+    """The gap this fixes: a tool nobody wrote internal stages for used to
+    produce an empty trace, so opening its row in the UI showed nothing.
+    Every call now records the invocation itself."""
+    monkeypatch.setattr(ft, "detect_source",
+                        lambda url, fetcher: __import__("docsforge").Detection("llms_txt", url))
+
+    out = ft.run_tool("detect_source_type", {"url": "https://x.dev/llms.txt"})
     trace = last_trace()
     assert trace.finished is not None, "an ordinary tool call's trace closes immediately"
-    assert trace.events() == []  # nothing to report, and nothing invented
+
+    call = by_name(trace, "detect_source_type")
+    assert call.state == tr.COMPLETED
+    assert call.metadata == {"url": "https://x.dev/llms.txt"}, "what was executed"
+    assert call.output == out, "what came back"
+    assert call.target == "https://x.dev/llms.txt"
 
 
-def test_run_tool_records_a_tool_failed_event_on_error():
-    ft.run_tool("read_knowledge_base", {"name": "nothing-stored-under-this"})
+def test_a_failed_call_records_the_failure_and_the_text_the_model_was_given():
+    out = ft.run_tool("read_knowledge_base", {"name": "nothing-stored-under-this"})
     trace = last_trace()
-    failed = by_name(trace, "tool failed")
-    assert failed.state == tr.FAILED
-    assert failed.error
+    call = by_name(trace, "read_knowledge_base")
+    assert call.state == tr.FAILED
+    assert call.error
+    # A failed call still produced a result; the detail view must be able to
+    # show exactly what the model received.
+    assert call.output == out
+
+
+def test_arguments_are_sanitized_before_reaching_the_browser(monkeypatch):
+    """Tools take URLs and names today, but the boundary has to hold for
+    whatever a future tool accepts."""
+    captured = {}
+
+    def fake_tool(url, api_key=None, trace=None):
+        captured["ran"] = True
+        return "ok"
+
+    tool = ft.Tool("fake_secret_tool", "d",
+                   {"type": "object",
+                    "properties": {"url": {"type": "string"},
+                                  "api_key": {"type": "string"}}},
+                   fake_tool)
+    monkeypatch.setitem(ft.BY_NAME, "fake_secret_tool", tool)
+
+    ft.run_tool("fake_secret_tool", {"url": "https://x.dev", "api_key": "sk-live-secret"})
+    assert captured["ran"], "the real argument must still reach the tool"
+
+    call = by_name(last_trace(), "fake_secret_tool")
+    assert call.metadata["api_key"] == "[redacted]"
+    assert call.metadata["url"] == "https://x.dev"
+
+
+def test_a_large_output_is_bounded_and_the_omission_disclosed(monkeypatch):
+    big = "x" * (tr.MAX_OUTPUT + 5_000)
+
+    def fake_tool(url, trace=None):
+        return big
+
+    tool = ft.Tool("fake_big_tool", "d",
+                   {"type": "object", "properties": {"url": {"type": "string"}}},
+                   fake_tool)
+    monkeypatch.setitem(ft.BY_NAME, "fake_big_tool", tool)
+
+    out = ft.run_tool("fake_big_tool", {"url": "https://x.dev"})
+    assert len(out) == len(big), "the model still gets the whole result"
+
+    call = by_name(last_trace(), "fake_big_tool")
+    assert len(call.output) == tr.MAX_OUTPUT
+    assert call.omitted == 5_000, "what was left out is counted, not hidden"
+
+
+def test_internal_stages_nest_under_the_tool_call(monkeypatch):
+    monkeypatch.setattr(ft, "_resolve", lambda *a, **k: resolution())
+    monkeypatch.setattr(
+        ft, "tool_harvest_docs",
+        lambda url, name=None, max_pages=0, js=False, version=None, **kw: "Harvested — 2 pages")
+
+    ft.run_tool("learn_technology", {"name": "effect"})
+    trace = last_trace()
+    call = by_name(trace, "learn_technology")
+    resolving = by_name(trace, "resolving identity")
+
+    assert call.parent_id is None, "the tool call is the root of its own trace"
+    assert resolving.parent_id == call.id, "its stages hang beneath it"
 
 
 # ── tool_learn_technology: resolving -> harvesting stages ────
@@ -114,11 +186,12 @@ def test_failed_resolution_is_traced_with_every_candidate_considered(monkeypatch
     assert len(resolving.result["candidates"]) == 1
     assert resolving.result["candidates"][0]["verified"] is False
 
-    # The parent tool call is ALSO recorded as failed -- run_tool()'s own
-    # bookkeeping -- without erasing the more specific resolution failure.
-    failed = by_name(trace, "tool failed")
-    assert failed.state == tr.FAILED
+    # The tool call itself is ALSO recorded as failed, without erasing the
+    # more specific resolution failure nested beneath it.
+    call = by_name(trace, "learn_technology")
+    assert call.state == tr.FAILED
     assert resolving.state == tr.FAILED  # still true; not overwritten
+    assert resolving.parent_id == call.id
 
 
 def test_already_stored_technology_is_traced_without_a_harvest(monkeypatch):

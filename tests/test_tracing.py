@@ -221,6 +221,38 @@ def test_sanitize_caps_oversized_strings():
     assert len(out) < 5_000
 
 
+# ── output capture: bounded, and truncation always disclosed ──
+def test_clip_returns_everything_when_it_fits():
+    body, omitted = tr.clip("short")
+    assert body == "short"
+    assert omitted == 0
+
+
+def test_clip_counts_what_it_left_out():
+    body, omitted = tr.clip("x" * 100, limit=30)
+    assert len(body) == 30
+    assert omitted == 70, "the omission is counted, so the UI can state it"
+
+
+def test_stage_output_is_bounded_and_discloses_the_omission():
+    ctx = tr.start("x")
+    stage = ctx.stage("harvesting")
+    stage.start()
+    stage.finish(tr.COMPLETED, output="y" * (tr.MAX_OUTPUT + 1_234))
+
+    ev = tr.get(ctx.trace_id).events()[-1]
+    assert len(ev.output) == tr.MAX_OUTPUT
+    assert ev.omitted == 1_234
+
+
+def test_output_survives_as_dict_for_the_browser():
+    ctx = tr.start("x")
+    ctx.event("returned", output="the answer", message="ok")
+    payload = tr.get(ctx.trace_id).events()[-1].as_dict()
+    assert payload["output"] == "the answer"
+    assert payload["omitted"] == 0
+
+
 # ── 8. a broken trace cannot break the operation ──────────
 def test_trace_append_failure_is_swallowed(monkeypatch):
     ctx = tr.start("effect")

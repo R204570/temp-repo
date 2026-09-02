@@ -58,6 +58,18 @@ MAX_EVENTS = 2000
 _SENSITIVE = ("key", "token", "secret", "password", "authorization",
               "cookie", "credential", "bearer", "auth")
 
+#: Cap on any single string passing through `sanitize()`. A summary field
+#: that arrives page-sized is a mistake somewhere upstream, not something
+#: to forward to a browser.
+MAX_STRING = 4_000
+
+#: Cap on a tool's own returned text, which is the one field that is
+#: *legitimately* long -- it is the answer the model was given, and showing
+#: it is the entire point of the detail view. Larger than MAX_STRING and
+#: still bounded, with whatever is dropped counted rather than silently
+#: cut: an undisclosed truncation is the one thing this project refuses.
+MAX_OUTPUT = 20_000
+
 _counter = itertools.count(1)
 
 
@@ -80,9 +92,21 @@ def sanitize(value: Any) -> Any:
         return out
     if isinstance(value, (list, tuple)):
         return [sanitize(v) for v in value]
-    if isinstance(value, str) and len(value) > 4000:
-        return value[:4000] + "…"
+    if isinstance(value, str) and len(value) > MAX_STRING:
+        return value[:MAX_STRING] + "…"
     return value
+
+
+def clip(text: str, limit: int = MAX_OUTPUT) -> tuple[str, int]:
+    """A bounded copy of `text`, and how many characters were left out.
+
+    Returns (kept, omitted). `omitted` is what lets the UI say "12,431 more
+    characters" instead of ending mid-sentence and hoping nobody notices.
+    """
+    body = text or ""
+    if len(body) <= limit:
+        return body, 0
+    return body[:limit], len(body) - limit
 
 
 @dataclass
@@ -108,6 +132,13 @@ class TraceEvent:
     result: dict | None = None
     error: str = ""
     counters: dict = field(default_factory=dict)
+    #: The operation's own returned text, bounded by MAX_OUTPUT. Kept apart
+    #: from `result` (a small structured summary) because this is the raw
+    #: thing the model was handed, and seeing exactly that is what "what was
+    #: the output" means.
+    output: str = ""
+    #: Characters of `output` not sent. Non-zero means the view must say so.
+    omitted: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -115,7 +146,8 @@ class TraceEvent:
             "type": self.type, "name": self.name, "state": self.state,
             "ts": self.ts, "message": self.message, "metadata": self.metadata,
             "target": self.target, "result": self.result, "error": self.error,
-            "counters": self.counters,
+            "counters": self.counters, "output": self.output,
+            "omitted": self.omitted,
         }
 
 
@@ -306,19 +338,22 @@ class Stage:
         self._done = False
 
     def _emit(self, state: str, *, message: str = "", result=None,
-             error: str = "", counters: dict | None = None) -> None:
+             error: str = "", counters: dict | None = None,
+             output: str = "") -> None:
         if self._done:
             return
         if state in _TERMINAL:
             self._done = True
         if counters:
             self.counters.update(counters)
+        body, omitted = clip(output) if output else ("", 0)
         try:
             self._ctx._trace.append(TraceEvent(
                 id=self.id, trace_id=self._ctx.trace_id, parent_id=self._ctx.parent_id,
                 type="stage", name=self.name, state=state, message=message,
                 target=sanitize(self._target), metadata=sanitize(self._metadata),
-                result=sanitize(result), error=error, counters=dict(self.counters)))
+                result=sanitize(result), error=error, counters=dict(self.counters),
+                output=body, omitted=omitted))
         except Exception:
             pass
 
@@ -338,9 +373,10 @@ class Stage:
         self._emit(CANCELLED, message=message)
 
     def finish(self, state: str = COMPLETED, *, message: str = "",
-              result=None, error: str = "", counters: dict | None = None) -> None:
+              result=None, error: str = "", counters: dict | None = None,
+              output: str = "") -> None:
         self._emit(state, message=message, result=result, error=error,
-                  counters=counters)
+                  counters=counters, output=output)
 
     def __enter__(self) -> "TraceContext":
         return self.start()
@@ -374,15 +410,18 @@ class TraceContext:
 
     def event(self, name: str, *, state: str = COMPLETED, message: str = "",
              target: str = "", metadata: dict | None = None, result=None,
-             error: str = "", counters: dict | None = None) -> None:
+             error: str = "", counters: dict | None = None,
+             output: str = "") -> None:
         """One fire-and-forget fact -- no lifecycle of its own to track."""
+        body, omitted = clip(output) if output else ("", 0)
         try:
             self._trace.append(TraceEvent(
                 id=self._trace.next_id(), trace_id=self._trace.id,
                 parent_id=self.parent_id, type="event", name=name, state=state,
                 message=message, target=sanitize(target),
                 metadata=sanitize(metadata or {}), result=sanitize(result),
-                error=error, counters=counters or {}))
+                error=error, counters=counters or {}, output=body,
+                omitted=omitted))
         except Exception:
             pass
 
