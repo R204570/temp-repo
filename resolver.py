@@ -416,6 +416,17 @@ def probe_docs_root(url: str, fetcher: Fetcher) -> list[Candidate]:
 #: evidence that the project owns the name.
 NAME_TLDS = ("dev", "io", "org", "com")
 
+#: A language whose bare name is a common word publishes on a `lang` domain
+#: for exactly that reason: ziglang.org, nim-lang.org, golang.org,
+#: rust-lang.org, julialang.org, kotlinlang.org, crystal-lang.org,
+#: elixir-lang.org, scala-lang.org, dlang.org, vlang.io, mojolang.org.
+#: `_owns_the_name` accepts these hosts, but nothing ever tried them, so the
+#: highest-signal source we have never saw the site: `zig` resolved to an npm
+#: templating library and `nim` to an unrelated repository -- both *verified*,
+#: each on a registry package that agreed with itself. Nearly all of them sit
+#: on .org, so this costs four probes rather than the full NAME_TLDS spread.
+LANG_TLDS = ("org", "io")
+
 #: A missing domain fails fast at DNS, so this can be tight.
 DOMAIN_TIMEOUT = 6
 
@@ -544,8 +555,11 @@ def from_domains(name: str, fetcher: Fetcher, state=None) -> list[Candidate]:
     slug = normalise(name)
     if not slug or len(slug) < 2:
         return []
-    return _probe_origins([(tld, f"https://{slug}.{tld}") for tld in NAME_TLDS],
-                          slug, fetcher, state=state)
+    origins = [(tld, f"https://{slug}.{tld}") for tld in NAME_TLDS]
+    if not slug.endswith("lang"):        # `golang` would give golanglang.org
+        origins += [(f"lang.{tld}", f"https://{slug}{sep}lang.{tld}")
+                    for sep in ("", "-") for tld in LANG_TLDS]
+    return _probe_origins(origins, slug, fetcher, state=state)
 
 
 # ─────────────────────────────────────────────────────────────

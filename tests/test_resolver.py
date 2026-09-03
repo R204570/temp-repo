@@ -505,3 +505,45 @@ def test_a_fresh_entry_under_the_current_rules_is_recalled(tmp_path, monkeypatch
 
     got = resolver.recall("mojo")
     assert got is not None and got.best.url == "https://mojolang.org/docs/"
+
+
+# --- languages publish on a `lang` domain, and nothing tried one ------------
+
+def _origins_probed_for(name, monkeypatch):
+    captured = []
+
+    def _spy(origins, slug, fetcher, state=None):
+        captured.extend(origins)
+        return []
+
+    monkeypatch.setattr(resolver, "_probe_origins", _spy)
+    resolver.from_domains(name, fetcher=None)
+    return [url for _label, url in captured]
+
+
+def test_from_domains_probes_the_lang_suffixed_shapes(monkeypatch):
+    """`zig` resolved to an npm templating library because nothing tried
+    ziglang.org, and `nim` to an unrelated repository for the same reason."""
+    probed = _origins_probed_for("zig", monkeypatch)
+    assert "https://ziglang.org" in probed
+    assert "https://zig-lang.org" in probed
+    assert "https://zig.dev" in probed, "the plain shapes must survive"
+
+
+def test_the_hyphenated_lang_shape_is_probed_too(monkeypatch):
+    """nim-lang.org and rust-lang.org carry the hyphen; golang.org does not."""
+    assert "https://nim-lang.org" in _origins_probed_for("nim", monkeypatch)
+    assert "https://rust-lang.org" in _origins_probed_for("rust", monkeypatch)
+
+
+def test_a_name_already_ending_in_lang_is_not_doubled(monkeypatch):
+    probed = _origins_probed_for("golang", monkeypatch)
+    assert not any("golanglang" in url for url in probed), probed
+    assert "https://golang.org" in probed
+
+
+def test_the_lang_shapes_cost_four_probes(monkeypatch):
+    """Two shapes over two TLDs. Nearly every one of them sits on .org, so a
+    full NAME_TLDS spread would be latency for nothing."""
+    probed = _origins_probed_for("zig", monkeypatch)
+    assert len(probed) == len(resolver.NAME_TLDS) + 4
