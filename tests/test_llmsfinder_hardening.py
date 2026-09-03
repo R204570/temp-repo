@@ -829,3 +829,51 @@ def test_no_page_limit_still_takes_the_whole_manifest():
     assert len(docs) == 30
     assert stats["truncated"] is False
     assert stats["whole"] is True
+
+
+# --- the manifest path is a crawl, and owes the host the same courtesy ------
+
+def test_manifest_acquisition_spaces_its_requests():
+    """`opts.delay` was honoured by `_crawl_html` and ignored here.
+
+    A 200-page manifest went out as 200 back-to-back requests to one host.
+    """
+    import time
+    import docsforge as df
+
+    seen = []
+
+    class _Clock(df.Fetcher):
+        def __init__(self):
+            pass
+
+        def text(self, url, timeout=None):
+            seen.append(time.monotonic())
+            return "# page" + chr(10) * 2 + "body"
+
+    links = [(f"p{i}", f"https://mojolang.org/docs/{i}.md") for i in range(4)]
+    docs, failed = df._acquire_manifest_links(
+        links, _Clock(), df.Options(delay=0.05))
+
+    assert len(docs) == 4 and not failed
+    gaps = [b - a for a, b in zip(seen, seen[1:])]
+    assert all(g >= 0.04 for g in gaps), gaps
+
+
+def test_manifest_acquisition_does_not_pace_when_no_delay_was_asked_for():
+    """The default must stay as fast as it was."""
+    import time
+    import docsforge as df
+
+    class _Instant(df.Fetcher):
+        def __init__(self):
+            pass
+
+        def text(self, url, timeout=None):
+            return "# page" + chr(10) * 2 + "body"
+
+    links = [(f"p{i}", f"https://mojolang.org/docs/{i}.md") for i in range(40)]
+    started = time.monotonic()
+    docs, _ = df._acquire_manifest_links(links, _Instant(), df.Options(delay=0.0))
+    assert len(docs) == 40
+    assert time.monotonic() - started < 0.5

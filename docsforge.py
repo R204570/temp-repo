@@ -1013,7 +1013,17 @@ def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
     #: place that knows a *documentation page* was just obtained, says so.
     note_page = getattr(fetcher, "page_fetched", None)
 
+    #: A manifest is a list of pages on one host, so acquiring it is a crawl
+    #: in everything but name -- 211 requests, for mojolang.org. `_crawl_html`
+    #: has spaced its requests to a host since the beginning; this path
+    #: ignored `opts.delay` outright and fired the lot back to back, which is
+    #: how a small documentation host learns to refuse us. Sequential here, so
+    #: spacing the starts is the whole of the politeness: there is never more
+    #: than one request open.
+    pace = _Pace(opts.delay)
+
     for title, link_url in links:
+        pace.wait(link_url)
         try:
             if llmsfinder.is_markdown_link(link_url):
                 text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
