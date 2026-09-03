@@ -79,7 +79,8 @@ def _page(title):
 def _decision(url, body, version=""):
     det = df.Detection("llms_txt", "https://x.dev/llms.txt", body)
     opts = df.Options(verbose=False, delay=0.0, version=version)
-    return df._scope_site_wide_llms(url, det, FakeFetcher({}), opts)
+    pathway = df._scope_site_wide_llms(url, det, FakeFetcher({}), opts)
+    return pathway.skip, pathway.restrict_links
 
 
 def test_version_scope_multi_version_manifest_is_filtered():
@@ -682,10 +683,10 @@ def test_a_bare_version_segment_is_not_mistaken_for_a_release_directory():
             + "- [api](https://d.dev/docs/api/)\n")
     det = df.Detection("llms_txt", "https://d.dev/llms.txt", body)
     opts = df.Options(verbose=False, delay=0.0, version="2.5")
-    skip, restrict = df._scope_site_wide_llms("https://d.dev/docs/", det,
-                                              FakeFetcher({}), opts)
-    assert skip is True, "nothing here documents 2.5"
-    assert restrict is None
+    pathway = df._scope_site_wide_llms("https://d.dev/docs/", det,
+                                       FakeFetcher({}), opts)
+    assert pathway.skip is True, "nothing here documents 2.5"
+    assert pathway.restrict_links is None
 
 
 # ── A narrowed manifest must not smuggle its own root back in ───────
@@ -723,12 +724,21 @@ def test_narrowing_to_a_release_drops_the_current_release_root():
     assert stats["whole"] is True
 
 
-def test_narrowing_to_a_section_drops_the_other_products_root():
-    """The docs.modular.com shape: one file covering the whole platform,
-    a request for one section of it."""
-    body = ("# Modular Cloud\n\n> summary\n\n"
-            + ("CLOUD BILLING AND API KEY PROSE. " * 60) + "\n\n"
-            + "- [Admin](https://d.dev/administration/keys/)\n"
+def test_narrowing_to_a_section_keeps_the_root():
+    """Narrowing for a *section* must not discard the file's own prose.
+
+    This asserted the opposite until a live run showed the cost: asking
+    mojolang.org for /docs/ narrowed to 212 pages and threw away 1.1 MB
+    whose root is literally "Mojo programming language documentation".
+
+    A section narrowing only happens once the file has shown it covers the
+    section — one covering none of it is refused outright and never reaches
+    here, which is what actually protects the docs.modular.com case, as
+    `test_a_site_wide_manifest_covering_another_product_is_refused` shows
+    against the real shape of that file (0 of 57 links under /mojo/)."""
+    body = ("# The Product\n\n> summary\n\n"
+            + ("Overview prose belonging to this very site. " * 60) + "\n\n"
+            + "- [Other](https://d.dev/administration/keys/)\n"
             + "- [Mojo A](https://d.dev/mojo/a/)\n"
             + "- [Mojo B](https://d.dev/mojo/b/)\n")
     pages = {
@@ -738,8 +748,12 @@ def test_narrowing_to_a_section_drops_the_other_products_root():
     }
     docs, _ = df.harvest("https://d.dev/mojo/", fetcher=FakeFetcher(pages), stats={})
 
-    assert sorted(d.url for d in docs) == ["https://d.dev/mojo/a/", "https://d.dev/mojo/b/"]
-    assert not any("CLOUD BILLING" in d.markdown for d in docs)
+    assert sorted(d.url for d in docs) == ["https://d.dev/llms.txt",
+                                           "https://d.dev/mojo/a/",
+                                           "https://d.dev/mojo/b/"]
+    assert any("Overview prose belonging" in d.markdown for d in docs)
+    # Out-of-section pages are still never fetched.
+    assert not any(d.url.startswith("https://d.dev/administration/") for d in docs)
 
 
 def test_an_unnarrowed_hybrid_still_keeps_its_root():

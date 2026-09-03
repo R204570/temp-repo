@@ -45,6 +45,7 @@ import reasoning
 import versions
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from typing import NamedTuple
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
@@ -1035,7 +1036,8 @@ def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
 
 def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                     stats: dict | None = None,
-                    restrict_links: list[tuple[str, str]] | None = None) -> list[Doc]:
+                    restrict_links: list[tuple[str, str]] | None = None,
+                    drop_root: bool = False) -> list[Doc]:
     """Acquire documentation from a detected llms.txt / llms-full.txt source.
 
     `restrict_links` is set by `harvest()` when the published file is not
@@ -1089,15 +1091,15 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
             # describe. The two are recorded separately so root success can
             # never stand in for corpus completeness.
             #
-            # The root is dropped whenever the links were narrowed. A caller
-            # narrows because the file as published is not what was asked
-            # for -- it is the current release when another was named, or a
-            # whole site when one section was -- and only the named subset
-            # survived that judgement. The root prose is the part that did
-            # not, so storing it anyway would put back exactly the content
-            # discovery had just refused, under the name of the thing that
-            # was asked for.
-            keep_root = restrict_links is None
+            # Whether the root survives is decided upstream, by *why* the
+            # links were narrowed -- see `Pathway.drop_root`. Narrowing for
+            # a release condemns the prose with the links, because the file
+            # documents a different release. Narrowing for a section does
+            # not: the file already showed it covers that section, and its
+            # overview is the same site's own words about it. Deciding here
+            # from `restrict_links is not None` conflated the two and threw
+            # away 1.1 MB of real documentation on mojolang.org.
+            keep_root = not drop_root
             root_doc = Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)
             if not keep_root:
                 _log(opts, "  dropping the root document: the manifest was narrowed, "
@@ -1232,15 +1234,29 @@ def _requested_release(url: str, opts: Options) -> str:
     return ""
 
 
+class Pathway(NamedTuple):
+    """How a published file may be used for one request.
+
+        skip           do not use it at all; fall down the ladder to a crawl
+        restrict_links use it, but only these entries (None = as published)
+        drop_root      discard its own prose along with the links it lost
+
+    `drop_root` is separate from `restrict_links` because narrowing happens
+    for two different reasons and only one of them condemns the prose. A
+    release request narrows because the file documents a *different*
+    release, so its text is the wrong release's text. A section request
+    narrows a file that has already shown it covers the section, and its
+    text is then the same site's overview of it.
+    """
+
+    skip: bool
+    restrict_links: list[tuple[str, str]] | None
+    drop_root: bool
+
+
 def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
-                          opts: Options) -> tuple[bool, list[tuple[str, str]] | None]:
+                          opts: Options) -> Pathway:
     """Which of the two acquisition pathways this request takes.
-
-    Returns `(skip, restrict_links)`:
-
-        (False, None)     use the published file as it stands
-        (False, [...])    use it, but only these entries
-        (True,  None)     do not use it; fall down the ladder to a crawl
 
     `llms.txt` and `llms-full.txt` are the reason to prefer publication over
     crawling: a site that publishes them has already produced its *current*
@@ -1263,20 +1279,20 @@ def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
     just a file about a different product on the same host.
     """
     if not _probed_at_the_root(url, det):
-        return False, None          # the caller pointed at this file itself
+        return Pathway(False, None, False)   # the caller pointed at this file itself
 
     asked = _requested_release(url, opts)
 
     if det.kind != "llms_txt":
         # Another strategy's artifact is all-or-nothing, and a site-wide one
         # cannot answer for a release nothing has checked.
-        return bool(asked), None
+        return Pathway(bool(asked), None, False)
 
     try:
         body = det.body if det.body is not None else fetcher.text(det.url,
                                                                   timeout=DUMP_TIMEOUT)
     except ForgeError:
-        return bool(asked), None
+        return Pathway(bool(asked), None, False)
     body = body.strip()
     links = (llmsfinder.parse_llms_links(body, det.url)
              if llmsfinder.classify_llms_shape(body) in ("index", "hybrid") else None)
@@ -1287,8 +1303,7 @@ def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
 
 
 def _pathway_for_release(asked: str, body: str, links: list[tuple[str, str]] | None,
-                         det: "Detection", opts: Options
-                         ) -> tuple[bool, list[tuple[str, str]] | None]:
+                         det: "Detection", opts: Options) -> "Pathway":
     """A specific release was named, so the published file has to earn it."""
     name = det.url.rsplit("/", 1)[-1]
 
@@ -1296,42 +1311,51 @@ def _pathway_for_release(asked: str, body: str, links: list[tuple[str, str]] | N
     if declared and versions.same_release(asked, declared):
         _log(opts, f"  {name} states version {declared} — that is the {asked} "
                    f"documentation, taking it whole")
-        return False, None
+        return Pathway(False, None, False)
 
     if links:
         scoped = _links_for_release(links, asked)
         if scoped:
             _log(opts, f"  narrowing {name} to the {len(scoped)} page(s) it files "
                        f"under version {asked}")
-            return False, scoped
+            # The root prose is the file's own text, and the file is
+            # published for the CURRENT release. Only its per-release links
+            # survived the check, so keeping the prose would put the wrong
+            # release's documentation in beside the right one's pages.
+            return Pathway(False, scoped, True)
 
     _log(opts, f"  ignoring {name}: it is published for the current release and "
                f"cannot show it documents {asked} — crawling that version instead")
-    return True, None
+    return Pathway(True, None, False)
 
 
 def _pathway_for_latest(url: str, links: list[tuple[str, str]] | None,
-                        det: "Detection", opts: Options
-                        ) -> tuple[bool, list[tuple[str, str]] | None]:
+                        det: "Detection", opts: Options) -> "Pathway":
     """No release named: the current documentation is the thing wanted, and
     the published file is it — subject only to actually covering the section
     that was asked for."""
     prefix = docs_scope(url)
     if prefix == "/":
-        return False, None          # the whole site, in one request
+        return Pathway(False, None, False)   # the whole site, in one request
     if links is None:
         # A dump lists no pages, so it makes no checkable claim about what it
         # covers. Refusing on a suspicion nothing supports would trade a
         # site's whole published corpus for a crawl.
-        return False, None
+        return Pathway(False, None, False)
 
     scoped = _links_under(links, prefix)
     if scoped:
-        return False, scoped
+        # Narrowed, but the root prose stays. Reaching here means the file
+        # has already shown it covers this section -- a file covering none of
+        # it is refused below and never narrowed at all. Its overview is then
+        # this site's own words about a site that includes the section, and
+        # dropping it cost 1.1 MB of real documentation on mojolang.org,
+        # whose root is literally "Mojo programming language documentation".
+        return Pathway(False, scoped, False)
 
     _log(opts, f"  the site-wide {det.url.rsplit('/', 1)[-1]} lists {len(links)} "
                f"page(s) and none under {prefix} — it documents something else")
-    return True, None
+    return Pathway(True, None, False)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2648,9 +2672,10 @@ def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = Non
             # version. If the manifest itself can prove which of its entries
             # belong to that version, use just those; otherwise crawl the
             # version they named instead.
-            skip_llms, restrict_links = _scope_site_wide_llms(url, det, fetcher, opts)
+            pathway = _scope_site_wide_llms(url, det, fetcher, opts)
+            restrict_links = pathway.restrict_links
 
-            if skip_llms:
+            if pathway.skip:
                 _log(opts, "  ignoring the site-wide llms.txt: it does not cover "
                            "the section this URL asks for")
             else:
@@ -2661,7 +2686,8 @@ def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = Non
                 try:
                     if det.kind == "llms_txt":
                         docs = handle_llms_txt(det, fetcher, opts, stats=stats,
-                                               restrict_links=restrict_links)
+                                               restrict_links=restrict_links,
+                                               drop_root=pathway.drop_root)
                     else:
                         docs = HANDLERS[det.kind](det, fetcher, opts)
                 except ForgeError as e:
