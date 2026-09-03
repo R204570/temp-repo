@@ -315,3 +315,145 @@ def test_an_unknown_package_says_so_and_suggests_a_url():
     got = resolver.resolve("not-a-real-package-xyz", fetcher=fetcher)
     assert got.best is None and not got.candidates
     assert "harvest_docs" in got.note
+
+
+# ── a refusal caused by the network is not a fact about the name ────
+# Found live: on a NAT64 network every candidate for "mojo" was refused as
+# a "private address", so six were found and none could be read. That
+# refusal was cached for REJECT_TTL -- seven days of confident wrong
+# answers for a cause fixed the same day.
+def _refusal(reasons):
+    got = resolver.Resolution(name="mojo", ecosystem="pypi")
+    got.candidates = [
+        resolver.Candidate(f"https://x.dev/{i}", "registry", 0.8, "e", False, r)
+        for i, r in enumerate(reasons)
+    ]
+    return got
+
+
+def test_a_refusal_where_nothing_could_be_read_is_not_remembered():
+    unreachable = _refusal([
+        "could not be read: Refusing to fetch private/loopback address: x.dev",
+        "could not be read: HTTP 000 for https://x.dev/1",
+    ])
+    assert resolver.learned_nothing(unreachable) is True
+
+
+def test_a_refusal_reached_by_actually_reading_the_pages_is_remembered():
+    """This one IS a finding: the candidates were fetched and did not
+    document the package. Forgetting it would re-crawl them every time."""
+    checked = _refusal(["never mentions it", "names a different project"])
+    assert resolver.learned_nothing(checked) is False
+
+
+def test_a_partly_unreachable_refusal_is_still_remembered():
+    """If even one candidate was actually read, the run learned something."""
+    mixed = _refusal(["could not be read: timeout", "never mentions it"])
+    assert resolver.learned_nothing(mixed) is False
+
+
+def test_a_successful_resolution_is_always_remembered():
+    got = resolver.Resolution(name="mojo")
+    cand = resolver.Candidate("https://x.dev", "registry", 0.9, "e", True, "names it")
+    got.candidates, got.best = [cand], cand
+    assert resolver.learned_nothing(got) is False
+
+
+def test_remember_files_nothing_when_nothing_was_learned(tmp_path, monkeypatch):
+    monkeypatch.setattr(resolver, "_load_cache", lambda: {})
+    saved = {}
+    monkeypatch.setattr(resolver, "_save_cache", lambda d: saved.update(d))
+
+    resolver.remember("mojo", _refusal(["could not be read: refused"]))
+    assert saved == {}, "an unreachable run must leave the cache untouched"
+
+    resolver.remember("mojo", _refusal(["never mentions it"]))
+    assert "mojo" in saved, "a real refusal is still filed"
+
+
+# --- A redirect onto a code host is not an ownership claim -------------------
+#
+# Live regression. `mojo.dev` redirects onto `github.com/gdejohn/procrastination`
+# - a Java library, since Maven plugins are also called "mojos". The domain
+# probe recorded "we got here from mojo.dev", `identity_signals` turned that
+# into `own-domain` without looking at where it landed, a registry package
+# named `mojo` supplied the second strong signal, and the gate stamped
+# `verified` on a page that never says the word "mojo" at all.
+
+def _via_domain(url, name="mojo", body=""):
+    return resolver.identity_signals(
+        Candidate(url, "domain:dev", 0.75, ""), name, body, {"via_domain": True})
+
+
+def test_a_domain_redirecting_onto_a_forge_does_not_own_the_name():
+    signals = _via_domain("https://github.com/gdejohn/procrastination")
+    assert "own-domain" not in signals
+
+
+def test_forges_are_refused_however_we_arrived_at_them():
+    for url in ("https://gitlab.com/someone/mojo",
+                "https://bitbucket.org/someone/mojo",
+                "https://raw.githubusercontent.com/x/mojo/main/README.md"):
+        assert "own-domain" not in _via_domain(url), url
+
+
+def test_a_domain_that_redirects_off_itself_still_owns_the_name():
+    """The case the rule exists for: terraform.io lands on hashicorp's host."""
+    signals = _via_domain("https://developer.hashicorp.com/terraform",
+                          name="terraform")
+    assert "own-domain" in signals
+
+
+def test_a_repo_page_is_still_reachable_by_its_own_evidence():
+    """Denying `own-domain` must not deny the candidate outright.
+
+    A repo page can still be identified - it just has to say so itself rather
+    than inherit the claim from a redirect it had no part in.
+    """
+    signals = _via_domain("https://github.com/modular/mojo",
+                          body="mojo " * (resolver.MIN_MENTIONS + 2))
+    assert "own-domain" not in signals
+    assert any(s.startswith("names-it") for s in signals)
+
+
+def test_the_wrong_mojo_no_longer_clears_the_identity_gate():
+    """Exactly the signals the live run produced, minus the one it should not."""
+    assert resolver.is_identified(["own-domain", "registry-agreement"])
+    assert not resolver.is_identified(["registry-agreement"])
+
+
+def test_a_language_owns_its_lang_suffixed_domain():
+    """The suffix exists because the bare name is a common word.
+
+    Every one of these was refused before, so Go, Rust, Julia, Nim, Crystal,
+    Elixir and Mojo could not claim the domain each of them publishes from.
+    """
+    for host, name in (("mojolang.org", "mojo"), ("golang.org", "go"),
+                       ("rust-lang.org", "rust"), ("julialang.org", "julia"),
+                       ("nim-lang.org", "nim"), ("crystal-lang.org", "crystal"),
+                       ("elixir-lang.org", "elixir")):
+        assert resolver._owns_the_name(f"https://{host}/docs/", name), host
+
+
+def test_the_lang_suffix_is_the_only_one_allowed():
+    """A prefix match would hand `mojo` to anything starting with it."""
+    for host in ("mojoportal.org", "mojolicious.org", "mojo-tools.com",
+                 "gopher.org", "rustacean.net"):
+        for name in ("mojo", "go", "rust"):
+            assert not resolver._owns_the_name(f"https://{host}/", name), host
+
+
+def test_mojos_own_docs_now_clear_the_gate_and_the_npm_package_does_not():
+    """The live outcome, as signals: 0.92 unverified became the answer."""
+    real = resolver.identity_signals(
+        Candidate("https://mojolang.org/docs/", "domain:org", 0.92, ""),
+        "mojo", "mojo " * (resolver.MIN_MENTIONS + 2), {"via_domain": True})
+    assert "own-domain" in real
+    assert resolver.is_identified(real)
+
+    # `github.com/classdojo/mojo.js` reached the gate on registry-agreement
+    # plus a handful of mentions. One strong signal and the name is the bar,
+    # so this still passes - which is why owning the domain has to outrank it.
+    assert resolver._owns_the_name("https://mojolang.org/docs/", "mojo")
+    assert not resolver._owns_the_name("https://github.com/classdojo/mojo.js",
+                                       "mojo")
