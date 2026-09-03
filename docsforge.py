@@ -42,6 +42,7 @@ from contextlib import contextmanager
 
 import llmsfinder
 import reasoning
+import versions
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from urllib.parse import urldefrag, urljoin, urlparse
@@ -99,6 +100,13 @@ class Options:
     #: Crawl boundary: "section" keeps to the docs root the start URL sits in,
     #: "host" is the whole domain, anything else is used as a literal prefix.
     scope: str = "section"
+    #: Which release the caller asked for, when they named one. This decides
+    #: which of the two acquisition pathways a harvest takes, so it has to
+    #: reach discovery rather than only the label at the end: a site
+    #: publishes `llms.txt` for its *current* release, and answering "give me
+    #: 1.10" with it stores the wrong documentation under the right name.
+    #: Empty means "whatever is current", which is what that file is for.
+    version: str = ""
     # Fetching a user-supplied URL server-side is an SSRF vector, so private /
     # loopback targets are refused unless explicitly allowed.
     allow_private: bool = field(
@@ -1043,6 +1051,34 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
     return [Doc(det.url, "llms.txt", _meta_header(det.url, "llms.txt") + body)]
 
 
+def _links_under(links: list[tuple[str, str]], prefix: str) -> list[tuple[str, str]]:
+    """Those links whose own path sits under `prefix`."""
+    out = []
+    for title, link in links:
+        path = urlparse(link).path
+        path = path if path.endswith("/") else path + "/"
+        if path.startswith(prefix):
+            out.append((title, link))
+    return out
+
+
+def _links_for_release(links: list[tuple[str, str]], asked: str) -> list[tuple[str, str]]:
+    """Those links whose own path names the release asked for.
+
+    For sites that file every release side by side — `/docs/1.10/…` beside
+    `/docs/2.11/…` — the manifest lists them all and the path is what says
+    which is which. Compared through `versions.same_release`, so asking for
+    "1.10" also matches "1.10.4" and never matches "1.9".
+    """
+    out = []
+    for title, link in links:
+        for part in (p for p in urlparse(link).path.split("/") if p):
+            if _VERSION.match(part) and versions.same_release(asked, part):
+                out.append((title, link))
+                break
+    return out
+
+
 def _manifest_links_under(prefix: str, det: "Detection", fetcher: Fetcher
                           ) -> tuple[list[tuple[str, str]] | None, int]:
     """The manifest's links whose own path sits under `prefix`, and how many
@@ -1060,13 +1096,7 @@ def _manifest_links_under(prefix: str, det: "Detection", fetcher: Fetcher
         return None, 0
 
     links = llmsfinder.parse_llms_links(body, det.url)
-    scoped = []
-    for title, link in links:
-        path = urlparse(link).path
-        path = path if path.endswith("/") else path + "/"
-        if path.startswith(prefix):
-            scoped.append((title, link))
-    return scoped, len(links)
+    return _links_under(links, prefix), len(links)
 
 
 def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
@@ -1095,58 +1125,121 @@ def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
     return scoped or None
 
 
+def _requested_release(url: str, opts: Options) -> str:
+    """The release the caller asked for, or `""` for "whatever is current".
+
+    Read from the `version` they passed first, and from the URL they pointed
+    at second — `/docs/v3/` names a release just as plainly as `version="v3"`
+    does, and a caller who gave both meant the one they typed.
+    """
+    asked = (getattr(opts, "version", "") or "").strip()
+    if asked:
+        return asked
+    for part in (p for p in urlparse(url).path.split("/") if p):
+        if _VERSION.match(part):
+            return part
+    return ""
+
+
 def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
                           opts: Options) -> tuple[bool, list[tuple[str, str]] | None]:
-    """What a site-wide `llms.txt` may contribute to a request scoped below it.
+    """Which of the two acquisition pathways this request takes.
 
     Returns `(skip, restrict_links)`:
 
-        (False, None)     use the file as published
+        (False, None)     use the published file as it stands
         (False, [...])    use it, but only these entries
-        (True,  None)     do not use it at all; fall down the ladder
+        (True,  None)     do not use it; fall down the ladder to a crawl
 
-    This is the version pass's invariant restated without the word
-    "version": **never broaden a scoped request.** `docs.modular.com` is
-    the case that showed the original wording was too narrow. It publishes
-    one `llms.txt` for Modular Cloud, so a request for `/mojo/` came back
-    as API-key and billing documentation — nothing about that is
-    version-specific, the file simply documents another product on the same
-    host, and `_asks_for_a_version` had no reason to fire.
+    `llms.txt` and `llms-full.txt` are the reason to prefer publication over
+    crawling: a site that publishes them has already produced its *current*
+    documentation, complete and LLM-ready, and reading it costs one request
+    against a crawl's hundreds. Which is exactly why the two cases divide:
 
-    What makes the refusal a finding rather than a guess is that the
-    manifest is checked against the request instead of assumed about. A
-    manifest that lists pages and puts none of them under the requested
-    prefix has demonstrated what it covers. A dump lists no pages, makes no
-    such claim, and is used as published — trading a site's whole published
-    corpus for a crawl on a suspicion nothing supports would cost far more
-    than it saves.
+    **No release named** — that published file is precisely what was asked
+    for. Take it. This is the pathway worth having, and it stays cheap.
+
+    **A release named** — the published file is the current one, and current
+    is not what was asked for. It answers only if it can *show* it is that
+    release: by stating so in its header, or by listing pages filed under
+    it. Otherwise the version-scoped crawl is the honest answer, because
+    storing one release's documentation under another's name is the failure
+    the whole version contract exists to prevent.
+
+    Sitting across both: never broaden a scoped request. `docs.modular.com`
+    publishes one `llms.txt` for Modular Cloud, so a request for `/mojo/`
+    came back as API-key and billing documentation — no release involved,
+    just a file about a different product on the same host.
     """
     if not _probed_at_the_root(url, det):
         return False, None          # the caller pointed at this file itself
-    prefix = docs_scope(url)
-    if prefix == "/":
-        return False, None          # the whole site is what was asked for
 
-    #: A version request keeps refusing on any doubt: two releases of one
-    #: library contradict each other, so an unverifiable manifest is worse
-    #: than a slower crawl. An ordinary scoped request has no such stake.
-    versioned = _asks_for_a_version(url)
+    asked = _requested_release(url, opts)
 
     if det.kind != "llms_txt":
-        return versioned, None      # another strategy's artifact is all-or-nothing
+        # Another strategy's artifact is all-or-nothing, and a site-wide one
+        # cannot answer for a release nothing has checked.
+        return bool(asked), None
 
     try:
-        scoped, total = _manifest_links_under(prefix, det, fetcher)
+        body = det.body if det.body is not None else fetcher.text(det.url,
+                                                                  timeout=DUMP_TIMEOUT)
     except ForgeError:
-        return versioned, None
+        return bool(asked), None
+    body = body.strip()
+    links = (llmsfinder.parse_llms_links(body, det.url)
+             if llmsfinder.classify_llms_shape(body) in ("index", "hybrid") else None)
 
-    if scoped is None:              # a dump: nothing checkable either way
-        return versioned, None
+    if asked:
+        return _pathway_for_release(asked, body, links, det, opts)
+    return _pathway_for_latest(url, links, det, opts)
+
+
+def _pathway_for_release(asked: str, body: str, links: list[tuple[str, str]] | None,
+                         det: "Detection", opts: Options
+                         ) -> tuple[bool, list[tuple[str, str]] | None]:
+    """A specific release was named, so the published file has to earn it."""
+    name = det.url.rsplit("/", 1)[-1]
+
+    declared = llmsfinder.declared_version(body)
+    if declared and versions.same_release(asked, declared):
+        _log(opts, f"  {name} states version {declared} — that is the {asked} "
+                   f"documentation, taking it whole")
+        return False, None
+
+    if links:
+        scoped = _links_for_release(links, asked)
+        if scoped:
+            _log(opts, f"  narrowing {name} to the {len(scoped)} page(s) it files "
+                       f"under version {asked}")
+            return False, scoped
+
+    _log(opts, f"  ignoring {name}: it is published for the current release and "
+               f"cannot show it documents {asked} — crawling that version instead")
+    return True, None
+
+
+def _pathway_for_latest(url: str, links: list[tuple[str, str]] | None,
+                        det: "Detection", opts: Options
+                        ) -> tuple[bool, list[tuple[str, str]] | None]:
+    """No release named: the current documentation is the thing wanted, and
+    the published file is it — subject only to actually covering the section
+    that was asked for."""
+    prefix = docs_scope(url)
+    if prefix == "/":
+        return False, None          # the whole site, in one request
+    if links is None:
+        # A dump lists no pages, so it makes no checkable claim about what it
+        # covers. Refusing on a suspicion nothing supports would trade a
+        # site's whole published corpus for a crawl.
+        return False, None
+
+    scoped = _links_under(links, prefix)
     if scoped:
         return False, scoped
 
-    _log(opts, f"  the site-wide {det.url.rsplit('/', 1)[-1]} lists {total} page(s) "
-               f"and none under {prefix} — it documents something else")
+    _log(opts, f"  the site-wide {det.url.rsplit('/', 1)[-1]} lists {len(links)} "
+               f"page(s) and none under {prefix} — it documents something else")
     return True, None
 
 

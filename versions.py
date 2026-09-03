@@ -90,6 +90,39 @@ def ordered(labels, newest_first: bool = True) -> list[str]:
     return sorted(labels, key=sort_key, reverse=newest_first)
 
 
+def release_parts(label: str) -> tuple[int, ...]:
+    """The dotted-numeric run of a release label, or `()` if it is not one.
+
+    `"v1.10.4"` and `"1.10.4"` both give `(1, 10, 4)`; `"latest"` gives `()`.
+    """
+    text = (label or "").strip()
+    match = _RELEASE.match(text)
+    if not match or not re.search(r"\d", text):
+        return ()
+    return tuple(int(p) for p in match.group(1).split("."))
+
+
+def same_release(asked: str, found: str) -> bool:
+    """Does `found` answer a request for `asked`?
+
+    Compared component by component, not as strings: a caller asking for
+    "1.10" is answered by "1.10.4", and one asking for "2" by "2.11" —
+    a request names as much of a release as the caller happened to know.
+    It is not answered by "1.9", and asking for "1.10" is not answered by
+    "2.11", which is the direction that actually matters: handing back
+    another release's documentation under the name of the one asked for is
+    the failure this exists to prevent.
+
+    Anything unorderable — "latest", "stable" — answers nothing, because it
+    makes no claim that can be checked.
+    """
+    a, b = release_parts(asked), release_parts(found)
+    if not a or not b:
+        return False
+    shared = min(len(a), len(b))
+    return a[:shared] == b[:shared]
+
+
 def why(label: str) -> str:
     """How this label was ranked — for the honesty contract.
 

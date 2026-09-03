@@ -177,7 +177,7 @@ HARVEST_PAGE_CAP = 0  # 0 = no limit
 
 
 def _options(crawl=False, max_pages=25, js=False, force=None, delay=0.4,
-             cap: int = FETCH_PAGE_CAP) -> Options:
+             cap: int = FETCH_PAGE_CAP, version: str | None = None) -> Options:
     requested = max(0, int(max_pages))
     if cap:
         pages = min(requested, cap) if requested else cap
@@ -189,6 +189,10 @@ def _options(crawl=False, max_pages=25, js=False, force=None, delay=0.4,
         js=bool(js),
         delay=float(delay),
         force=force or None,
+        # Which release was asked for has to reach discovery, not just the
+        # label: it decides whether a site's published `llms.txt` — always
+        # its *current* documentation — can answer the question at all.
+        version=(version or "").strip(),
         verbose=False,
     )
 
@@ -380,7 +384,7 @@ def _harvest_corpus(technology: str, corpus, max_pages: int, js: bool) -> str:
     import passages as psg
 
     opts = _options(crawl=True, max_pages=max_pages, js=js, delay=0.2,
-                    cap=HARVEST_PAGE_CAP)
+                    cap=HARVEST_PAGE_CAP, version=corpus.version)
     stats: dict = {}
     strategy = corpus.shape
 
@@ -739,7 +743,7 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
     """
     trace = trace or tracing.NULL_CONTEXT
     opts = _options(crawl=True, max_pages=max_pages, js=js, delay=0.2,
-                    cap=HARVEST_PAGE_CAP)
+                    cap=HARVEST_PAGE_CAP, version=version)
     opts.scope = scope or "section"
 
     started = time.time()

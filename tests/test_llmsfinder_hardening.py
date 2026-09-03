@@ -525,3 +525,124 @@ def test_a_dump_is_still_used_for_a_scoped_request():
 
     assert strategy == "llms-full.txt"
     assert len(docs) == 1
+
+
+# ── Two pathways: latest takes the published file, a release earns it ──
+# `llms.txt` is published for a site's CURRENT release. Until this split,
+# the requested version reached only the label, so asking for 1.10 fetched
+# the latest dump and filed it as "1.10" -- the wrong documentation under
+# exactly the right name.
+def _site(dump_body):
+    return {"https://d.dev/llms-full.txt": FakeResponse(dump_body)}
+
+
+def test_no_version_asked_takes_the_published_file_in_one_request():
+    dump = "# Docs\n\n" + ("Current release prose. " * 300)
+    fetcher = FakeFetcher(_site(dump))
+    docs, strategy = df.harvest("https://d.dev/docs/", fetcher=fetcher, stats={})
+
+    assert strategy == "llms-full.txt"
+    assert len(docs) == 1
+    assert len(fetcher.asked) == 1, "the whole point: one request"
+
+
+def test_a_named_release_refuses_a_file_that_cannot_show_it_is_that_release():
+    dump = "# Docs\n\n" + ("Current release prose. " * 300)
+    sitemap = ("<urlset>"
+               + "".join(f"<url><loc>https://d.dev/docs/p{i}</loc></url>" for i in range(3))
+               + "</urlset>")
+    pages = _site(dump)
+    pages["https://d.dev/sitemap.xml"] = FakeResponse(sitemap, ctype="application/xml")
+    for i in range(3):
+        pages[f"https://d.dev/docs/p{i}"] = FakeResponse(_page(f"P{i}"))
+
+    fetcher = FakeFetcher(pages)
+    opts = df.Options(verbose=False, delay=0.0, version="1.10")
+    docs, strategy = df.harvest("https://d.dev/docs/", opts, fetcher=fetcher, stats={})
+
+    assert strategy != "llms-full.txt", "the current release is not release 1.10"
+    assert strategy == "sitemap"
+    assert len(docs) == 3
+
+
+def test_a_named_release_takes_the_file_when_it_states_that_version():
+    dump = ("# Docs\n\n> summary\n\nVersion: 1.10.4\n\n"
+            + ("Release 1.10 prose. " * 300))
+    fetcher = FakeFetcher(_site(dump))
+    opts = df.Options(verbose=False, delay=0.0, version="1.10")
+    docs, strategy = df.harvest("https://d.dev/docs/", opts, fetcher=fetcher, stats={})
+
+    assert strategy == "llms-full.txt", "1.10.4 answers a request for 1.10"
+    assert len(docs) == 1
+
+
+def test_a_stated_version_from_a_different_release_is_still_refused():
+    dump = ("# Docs\n\n> summary\n\nVersion: 2.11.0\n\n"
+            + ("Release 2.11 prose. " * 300))
+    sitemap = ("<urlset>"
+               + "".join(f"<url><loc>https://d.dev/docs/p{i}</loc></url>" for i in range(3))
+               + "</urlset>")
+    pages = _site(dump)
+    pages["https://d.dev/sitemap.xml"] = FakeResponse(sitemap, ctype="application/xml")
+    for i in range(3):
+        pages[f"https://d.dev/docs/p{i}"] = FakeResponse(_page(f"P{i}"))
+
+    fetcher = FakeFetcher(pages)
+    opts = df.Options(verbose=False, delay=0.0, version="1.10")
+    docs, strategy = df.harvest("https://d.dev/docs/", opts, fetcher=fetcher, stats={})
+    assert strategy == "sitemap", "2.11 must never answer a request for 1.10"
+
+
+def test_a_named_release_is_narrowed_to_the_pages_filed_under_it():
+    """Sites that keep every release side by side list them all in one
+    manifest, and the path is what says which is which."""
+    manifest = ("# Docs\n\n> summary\n\n"
+                + "- [Old](https://d.dev/docs/1.9/a.md)\n"
+                + "- [Wanted A](https://d.dev/docs/1.10/a.md)\n"
+                + "- [Wanted B](https://d.dev/docs/1.10/b.md)\n"
+                + "- [New](https://d.dev/docs/2.11/a.md)\n")
+    pages = {
+        "https://d.dev/llms.txt": FakeResponse(manifest),
+        "https://d.dev/docs/1.10/a.md": FakeResponse("# A"),
+        "https://d.dev/docs/1.10/b.md": FakeResponse("# B"),
+    }
+    fetcher = FakeFetcher(pages)
+    opts = df.Options(verbose=False, delay=0.0, version="1.10")
+    stats = {}
+    docs, _ = df.harvest("https://d.dev/docs/", opts, fetcher=fetcher, stats=stats)
+
+    assert sorted(d.url for d in docs) == ["https://d.dev/docs/1.10/a.md",
+                                           "https://d.dev/docs/1.10/b.md"]
+    assert stats["expected"] == 2
+    assert not any("/1.9/" in u or "/2.11/" in u for u in fetcher.asked)
+
+
+def test_a_version_in_the_url_routes_the_same_way_as_one_passed_in():
+    """`/docs/v3/` names a release as plainly as version="v3" does."""
+    dump = "# Docs\n\n" + ("Current release prose. " * 300)
+    sitemap = ("<urlset>"
+               + "".join(f"<url><loc>https://d.dev/docs/v3/p{i}</loc></url>"
+                         for i in range(3))
+               + "</urlset>")
+    pages = _site(dump)
+    pages["https://d.dev/sitemap.xml"] = FakeResponse(sitemap, ctype="application/xml")
+    for i in range(3):
+        pages[f"https://d.dev/docs/v3/p{i}"] = FakeResponse(_page(f"P{i}"))
+
+    fetcher = FakeFetcher(pages)
+    docs, strategy = df.harvest("https://d.dev/docs/v3/", fetcher=fetcher, stats={})
+    assert strategy == "sitemap"
+    assert all("/v3/" in d.url for d in docs)
+
+
+def test_an_unorderable_label_answers_nothing():
+    """"latest" and "stable" are moving targets. A file claiming one has
+    made no checkable claim, so it cannot satisfy a release request."""
+    import versions as V
+
+    assert V.same_release("1.10", "1.10.4") is True
+    assert V.same_release("2", "2.11") is True
+    assert V.same_release("1.10", "1.9") is False
+    assert V.same_release("1.10", "2.11") is False
+    assert V.same_release("1.10", "latest") is False
+    assert V.same_release("latest", "1.10") is False
