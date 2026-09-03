@@ -659,6 +659,35 @@ def test_an_unorderable_label_answers_nothing():
     assert V.same_release("latest", "1.10") is False
 
 
+def test_a_less_specific_label_does_not_answer_a_more_specific_request():
+    """Found live: a request for Mojo 2.5 matched a stray link to `/2`,
+    because the comparison was symmetric. A page filed under the 2.x line
+    establishes nothing about 2.5 — the answer has to be at least as
+    specific as the question."""
+    import versions as V
+
+    assert V.same_release("2", "2.11") is True, "asking broadly accepts a point release"
+    assert V.same_release("2.5", "2") is False, "asking precisely rejects the whole line"
+    assert V.same_release("1.10", "1") is False
+    assert V.same_release("1.10", "1.10") is True
+
+
+def test_a_bare_version_segment_is_not_mistaken_for_a_release_directory():
+    """The live manifest that surfaced this had a link to `/2` in prose.
+    Asking for 2.5 must fall through to the crawl rather than harvest it."""
+    body = ("# Docs\n\n> summary\n\n"
+            + ("Current release prose. " * 200) + "\n\n"
+            + "- [add](https://d.dev/2)\n"
+            + "- [guide](https://d.dev/docs/guide/)\n"
+            + "- [api](https://d.dev/docs/api/)\n")
+    det = df.Detection("llms_txt", "https://d.dev/llms.txt", body)
+    opts = df.Options(verbose=False, delay=0.0, version="2.5")
+    skip, restrict = df._scope_site_wide_llms("https://d.dev/docs/", det,
+                                              FakeFetcher({}), opts)
+    assert skip is True, "nothing here documents 2.5"
+    assert restrict is None
+
+
 # ── A narrowed manifest must not smuggle its own root back in ───────
 # Narrowing says "the file as published is not what was asked for; only
 # this subset of it is". The root prose is part of what was refused, so

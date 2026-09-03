@@ -274,10 +274,13 @@ class Fetcher:
             raise ForgeError(f"URL has no host: {url!r}")
         if self.opts.allow_private:
             return
-        if _resolves_private(parsed.hostname or ""):
+        host = parsed.hostname or ""
+        if _resolves_private(host):
+            where = _private_address_of(host)
             raise ForgeError(
-                f"Refusing to fetch private/loopback address: {parsed.hostname}. "
-                f"Set DOCSFORGE_ALLOW_PRIVATE=1 to permit it."
+                f"Refusing to fetch private/loopback address: {host}"
+                + (f" resolves to {where}" if where else "")
+                + ". Set DOCSFORGE_ALLOW_PRIVATE=1 to permit it."
             )
 
     # -- primitives --------------------------------------------
@@ -353,6 +356,35 @@ def _decode(r: requests.Response) -> str:
     return r.text
 
 
+#: RFC 6052's well-known prefix for embedding an IPv4 address inside an
+#: IPv6 one. A DNS64 resolver hands these out on NAT64 networks — common on
+#: mobile carriers, IPv6-only CI runners, and plenty of home connections —
+#: and Python reports them as `is_reserved`, because the *prefix* is
+#: reserved. The address they carry is whatever IPv4 is in the low 32 bits,
+#: which is usually an ordinary public host.
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _unwrap_nat64(ip):
+    """The IPv4 address a NAT64 address carries, or the address itself.
+
+    Judging the wrapper instead of its contents is how `github.com` came to
+    be refused as a "private/loopback address" on a NAT64 network: it
+    resolves to 64:ff9b::14cf:4952, which carries the entirely public
+    20.207.73.82. Unwrapping loses no protection — a NAT64 address carrying
+    10.0.0.1 still unwraps to 10.0.0.1 and is still refused.
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64_WELL_KNOWN:
+        return ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
+def _is_private_address(ip) -> bool:
+    ip = _unwrap_nat64(ip)
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
 def _resolves_private(host: str) -> bool:
     if not host:
         return False
@@ -365,10 +397,31 @@ def _resolves_private(host: str) -> bool:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        if _is_private_address(ip):
             return True
     return False
+
+
+def _private_address_of(host: str) -> str:
+    """The address that made `_resolves_private` say yes, for the message.
+
+    Naming only the host left the refusal undiagnosable: a NAT64 network
+    refusing `github.com` reads as a bug in DocsForge, in the sandbox, or
+    in the site, and the one fact that distinguishes them — what the name
+    actually resolved to — was the one thing not reported.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return ""
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_private_address(ip):
+            return str(ip)
+    return ""
 
 
 # ─────────────────────────────────────────────────────────────

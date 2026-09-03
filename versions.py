@@ -105,13 +105,19 @@ def release_parts(label: str) -> tuple[int, ...]:
 def same_release(asked: str, found: str) -> bool:
     """Does `found` answer a request for `asked`?
 
-    Compared component by component, not as strings: a caller asking for
-    "1.10" is answered by "1.10.4", and one asking for "2" by "2.11" —
-    a request names as much of a release as the caller happened to know.
-    It is not answered by "1.9", and asking for "1.10" is not answered by
-    "2.11", which is the direction that actually matters: handing back
-    another release's documentation under the name of the one asked for is
-    the failure this exists to prevent.
+    Compared component by component, and *directionally*: what was found
+    must be at least as specific as what was asked for. Asking for "2" is
+    answered by "2.11", because the caller named as much of the release as
+    they knew and 2.11 is inside it. Asking for "2.5" is **not** answered by
+    "2" — a page filed under the 2.x line establishes nothing about 2.5, and
+    treating it as an answer is how a request for Mojo 2.5 once matched a
+    stray link to `/2`.
+
+    So: `asked` must be a prefix of `found`. "1.10" is answered by "1.10.4"
+    and by "1.10"; never by "1", "1.9" or "2.11". Handing back another
+    release's documentation under the name of the one asked for is the
+    failure this exists to prevent, and a comparison that is loose in
+    either direction is a way to commit it.
 
     Anything unorderable — "latest", "stable" — answers nothing, because it
     makes no claim that can be checked.
@@ -119,8 +125,7 @@ def same_release(asked: str, found: str) -> bool:
     a, b = release_parts(asked), release_parts(found)
     if not a or not b:
         return False
-    shared = min(len(a), len(b))
-    return a[:shared] == b[:shared]
+    return b[:len(a)] == a
 
 
 def why(label: str) -> str:
