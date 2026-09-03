@@ -877,3 +877,51 @@ def test_manifest_acquisition_does_not_pace_when_no_delay_was_asked_for():
     docs, _ = df._acquire_manifest_links(links, _Instant(), df.Options(delay=0.0))
     assert len(docs) == 40
     assert time.monotonic() - started < 0.5
+
+
+# --- a site-wide file is site-wide however we came by its URL ---------------
+
+_ROOT_MANIFEST = (
+    "# Mojo" + chr(10) + "version: 1.0.0" + chr(10) * 2 + "## Docs" + chr(10)
+    + chr(10).join(f"- [p{i}](https://mojolang.org/docs/p{i})" for i in range(3))
+)
+
+
+def _scope(url, det_url, version=""):
+    import docsforge as df
+    det = df.Detection(kind="llms_txt", url=det_url, body=_ROOT_MANIFEST)
+    return df._scope_site_wide_llms(url, det, None, df.Options(version=version))
+
+
+def test_a_release_request_is_checked_even_when_handed_the_root_file():
+    """Resolution now hands `learn_technology` the llms.txt URL itself.
+
+    The guard used to require that *we* had probed for the file, on the
+    reasoning that a URL the caller typed is a URL the caller meant. The
+    caller stopped typing it, so asking for Mojo 0.9 went straight past the
+    release check and took the current manifest whole.
+    """
+    got = _scope("https://mojolang.org/llms.txt",
+                 "https://mojolang.org/llms.txt", version="0.9")
+    assert got.skip, "0.9 must not be answered with the current release"
+
+
+def test_the_release_it_does_declare_is_still_taken_whole():
+    got = _scope("https://mojolang.org/llms.txt",
+                 "https://mojolang.org/llms.txt", version="1.0")
+    assert not got.skip and got.restrict_links is None
+
+
+def test_no_release_named_still_takes_the_whole_site():
+    """The 211-page Mojo harvest goes through here; it must not narrow."""
+    got = _scope("https://mojolang.org/llms.txt",
+                 "https://mojolang.org/llms.txt")
+    assert not got.skip and got.restrict_links is None and not got.drop_root
+
+
+def test_a_file_below_the_root_is_left_alone():
+    """`/en/4.2/llms.txt` is already the file that was asked for. Putting it
+    through the release check would narrow, or refuse, the right one."""
+    got = _scope("https://d.org/en/4.2/", "https://d.org/en/4.2/llms.txt",
+                 version="4.2")
+    assert not got.skip and got.restrict_links is None and not got.drop_root

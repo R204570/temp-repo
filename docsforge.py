@@ -1288,8 +1288,8 @@ def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
     came back as API-key and billing documentation — no release involved,
     just a file about a different product on the same host.
     """
-    if not _probed_at_the_root(url, det):
-        return Pathway(False, None, False)   # the caller pointed at this file itself
+    if not _at_the_site_root(det):
+        return Pathway(False, None, False)   # already scoped below the root
 
     asked = _requested_release(url, opts)
 
@@ -1297,6 +1297,14 @@ def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
         # Another strategy's artifact is all-or-nothing, and a site-wide one
         # cannot answer for a release nothing has checked.
         return Pathway(bool(asked), None, False)
+
+    # Nothing below can change the answer when no release was named and the
+    # caller's URL already covers the whole site: `_pathway_for_latest` takes
+    # the file as published, whatever its links turn out to say. Reading the
+    # body to discover that costs a second fetch of a file already in hand,
+    # which is precisely the redundant discovery the ladder forbids.
+    if not asked and docs_scope(url) == "/":
+        return Pathway(False, None, False)
 
     try:
         body = det.body if det.body is not None else fetcher.text(det.url,
@@ -1935,10 +1943,23 @@ def docs_scope(url: str) -> str:
     return "/" + "/".join(folder) + "/" if folder else "/"
 
 
-def _probed_at_the_root(url: str, det: Detection) -> bool:
-    """True when a detection came from probing the origin rather than from the
-    URL the caller actually gave us."""
-    return det.url != url and urlparse(det.url).path.count("/") == 1
+def _at_the_site_root(det: Detection) -> bool:
+    """True when the detected file sits at the origin root.
+
+    A file there describes the whole site, so it cannot be assumed to answer
+    a request for one release or one section of it. What matters is where the
+    file sits, not how we came by its URL: this used to also require that we
+    had *probed* for it, on the reasoning that a URL the caller typed is a URL
+    the caller meant. But the caller does not type it any more — resolution
+    hands `learn_technology` whatever it found, and it now finds
+    `mojolang.org/llms.txt` directly. Asking for Mojo 0.9 then went straight
+    past the release check and took the current manifest whole.
+
+    A file below the root is still left alone: `/en/4.2/llms.txt` is already
+    scoped to what was asked for, and putting it through the release check
+    would narrow, or refuse, a file that is the right one.
+    """
+    return urlparse(det.url).path.count("/") == 1
 
 
 def _normalize(url: str) -> str:
