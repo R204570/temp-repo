@@ -457,3 +457,51 @@ def test_mojos_own_docs_now_clear_the_gate_and_the_npm_package_does_not():
     assert resolver._owns_the_name("https://mojolang.org/docs/", "mojo")
     assert not resolver._owns_the_name("https://github.com/classdojo/mojo.js",
                                        "mojo")
+
+
+# --- a fix has to reach the cache too ---------------------------------------
+
+def test_an_entry_decided_under_older_rules_is_not_recalled(tmp_path, monkeypatch):
+    """The wrong answer for `mojo` was filed as a success, TTL thirty days."""
+    cache = tmp_path / "resolve.json"
+    monkeypatch.setenv("DOCSFORGE_RESOLVE_CACHE", str(cache))
+
+    result = resolver.Resolution(name="mojo")
+    result.best = Candidate("https://github.com/gdejohn/procrastination",
+                            "domain:dev", 0.75, "", True, "identified by ...")
+    result.candidates = [result.best]
+    resolver.remember("mojo", result)
+    assert resolver.recall("mojo") is not None
+
+    monkeypatch.setattr(resolver, "RULES", resolver.RULES + 1)
+    assert resolver.recall("mojo") is None
+
+
+def test_an_entry_written_before_the_stamp_existed_is_discarded(tmp_path,
+                                                               monkeypatch):
+    """Every cache in the wild predates it, and every one of them is stale."""
+    import json
+    import time
+    cache = tmp_path / "resolve.json"
+    cache.write_text(json.dumps({"mojo": {
+        "at": time.time(), "url": "https://github.com/gdejohn/procrastination",
+        "evidence": "", "reason": "", "signals": [], "ecosystem": "",
+        "resolved_via": "domain", "note": "",
+    }}), encoding="utf-8")
+    monkeypatch.setenv("DOCSFORGE_RESOLVE_CACHE", str(cache))
+    assert resolver.recall("mojo") is None
+
+
+def test_a_fresh_entry_under_the_current_rules_is_recalled(tmp_path, monkeypatch):
+    """The stamp must not break the cache it is protecting."""
+    cache = tmp_path / "resolve.json"
+    monkeypatch.setenv("DOCSFORGE_RESOLVE_CACHE", str(cache))
+
+    result = resolver.Resolution(name="mojo")
+    result.best = Candidate("https://mojolang.org/docs/", "domain:org", 0.92,
+                            "", True, "identified by own-domain")
+    result.candidates = [result.best]
+    resolver.remember("mojo", result)
+
+    got = resolver.recall("mojo")
+    assert got is not None and got.best.url == "https://mojolang.org/docs/"

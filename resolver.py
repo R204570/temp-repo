@@ -976,6 +976,19 @@ def from_evidence(name: str, state, fetcher: Fetcher, budget=None) -> list[Candi
 CACHE_TTL = 30 * 86400
 REJECT_TTL = 7 * 86400
 
+#: Which set of identity rules decided an entry. Bump it whenever they
+#: change. An answer reached under superseded rules is evidence about the
+#: code that wrote it, not about the name, so `recall` discards it and the
+#: next resolution earns its answer again.
+#:
+#: Written because a fix does not reach a cache. The run that resolved `mojo`
+#: to a Java library filed that as a success, and `CACHE_TTL` would have
+#: served it for thirty days -- outliving the fix by four weeks, on the one
+#: name whose failure prompted the fix. Entries written before this stamp
+#: existed carry no `rules` key and are discarded on sight, which is the
+#: intended effect: they were all decided under rules that have since moved.
+RULES = 1
+
 
 def _cache_file() -> Path:
     return Path(os.environ.get("DOCSFORGE_RESOLVE_CACHE")
@@ -1005,6 +1018,8 @@ def recall(name: str) -> Resolution | None:
     entry = _load_cache().get(normalise(name))
     if not entry:
         return None
+    if entry.get("rules") != RULES:
+        return None     # decided under rules this build no longer applies
     age = time.time() - entry.get("at", 0)
     if age > (CACHE_TTL if entry.get("url") else REJECT_TTL):
         return None
@@ -1055,6 +1070,7 @@ def remember(name: str, result: Resolution) -> None:
     best = result.best
     data[normalise(name)] = {
         "at": time.time(),
+        "rules": RULES,
         "url": best.url if best else "",
         "evidence": best.evidence if best else "",
         "reason": best.reason if best else "",
