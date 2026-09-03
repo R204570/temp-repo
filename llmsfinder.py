@@ -16,6 +16,36 @@ from urllib.parse import urljoin, urlparse
 #: Markdown link pattern: [title](url)
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 
+#: A `Version:` line, as sites actually write it in an `llms.txt` header.
+#: The convention has no schema — it fixes the title and the `>` summary and
+#: leaves everything else to the publisher — but where a site states which
+#: release the file documents, this is the shape it states it in.
+_VERSION_LINE = re.compile(r"^[ \t]*version[ \t]*:[ \t]*(\S+)[ \t]*$", re.I | re.M)
+
+#: How far into a file the header is still the header, for sites that put no
+#: `##` section in at all.
+_HEADER_CHARS = 2_000
+
+
+def declared_version(text: str) -> str:
+    """The version an `llms.txt` states about itself, or `""`.
+
+    Read only from the header — everything above the first `##` section —
+    because further down a `Version:` line is documentation *about* versions
+    (a changelog entry, an installation transcript, a CLI example) rather
+    than a claim this file makes about itself.
+
+    Returns the raw token and judges nothing: whether it is a release number
+    worth filing a harvest under is a question `versions.py` already answers,
+    and answering it twice is how two rankings drift apart.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    head = re.split(r"^##[ \t]", body, maxsplit=1, flags=re.M)[0][:_HEADER_CHARS]
+    match = _VERSION_LINE.search(head)
+    return match.group(1).strip() if match else ""
+
 
 def classify_llms_shape(text: str) -> str:
     """Classify an `llms.txt` document into Shape A (index), Shape B (dump), or Shape C (hybrid).
