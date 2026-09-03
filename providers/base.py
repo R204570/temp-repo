@@ -53,6 +53,12 @@ def tool_end(name: str, result: str, kind: str = "") -> dict:
         "chars": len(result),
         "kind": kind,
         "preview": result[:200],
+        # The whole result, not just the preview. A provider that runs tools
+        # outside this process -- the Claude Code CLI calls them over MCP --
+        # leaves `run_tool` no chance to record what came back, and this is
+        # then the only place the answer exists. It is bounded before it
+        # reaches a browser, by tracing.clip(), not here.
+        "result": result,
     }
 
 

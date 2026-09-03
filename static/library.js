@@ -117,6 +117,77 @@ function arming(button, label, confirmLabel, run) {
   return button;
 }
 
+/* ── right-click a technology ─────────────────────────────
+   Deleting a whole technology was reachable only from inside it: open the
+   technology, scroll past its versions, then the wide button at the foot.
+   That is three steps to undo one mistaken harvest, and nothing on the
+   listing said the option existed. Right-click is where people already
+   look for "do something to this row". */
+let menuEl = null;
+
+function closeMenu() {
+  if (menuEl) {
+    menuEl.remove();
+    menuEl = null;
+  }
+}
+
+function openMenu(x, y, tech) {
+  closeMenu();
+  const menu = el("div", "row-menu");
+  menu.setAttribute("role", "menu");
+
+  const title = el("div", "row-menu-title", tech.name);
+  menu.append(title);
+
+  // Not named `open`: that is the module's own refresh function, and
+  // shadowing it here is how the delete below would silently stop
+  // redrawing the listing.
+  const openItem = el("button", "row-menu-item");
+  openItem.type = "button";
+  openItem.setAttribute("role", "menuitem");
+  openItem.append(el("span", null, "Open"));
+  openItem.addEventListener("click", () => {
+    closeMenu();
+    go(tech.name);
+  });
+  menu.append(openItem);
+
+  menu.append(arming(
+    Object.assign(el("button", "row-menu-item danger"), { type: "button" }),
+    `Delete all ${plural(tech.versions, "version")}`,
+    "Really delete everything?",
+    async () => {
+      await api(`/api/library/${encodeURIComponent(tech.name)}`, "DELETE");
+      closeMenu();
+      // Deleting the technology currently open would leave the detail pane
+      // showing something that no longer exists.
+      if (state.tech === tech.name) return go(null);
+      return open();
+    }));
+
+  document.body.append(menu);
+  menuEl = menu;
+
+  // Placed after insertion so the real size is known: a menu that opens
+  // past the bottom of a long listing is a menu you cannot use.
+  const box = menu.getBoundingClientRect();
+  const left = Math.min(x, window.innerWidth - box.width - 8);
+  const top = Math.min(y, window.innerHeight - box.height - 8);
+  menu.style.left = `${Math.max(8, left)}px`;
+  menu.style.top = `${Math.max(8, top)}px`;
+  menu.querySelector("button").focus();
+}
+
+document.addEventListener("click", (e) => {
+  if (menuEl && !e.target.closest(".row-menu")) closeMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeMenu();
+});
+window.addEventListener("resize", closeMenu);
+window.addEventListener("scroll", closeMenu, true);
+
 /** How many crawls of this technology the store holds, drawn as stacked
     card edges. The tab matters: a plain rectangle at one version reads as
     an empty checkbox, which invites a click that does nothing. */
@@ -266,6 +337,20 @@ function renderBox() {
 
     btn.append(text);
     btn.addEventListener("click", () => go(t.name));
+    btn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openMenu(e.clientX, e.clientY, t);
+    });
+    // Right-click is not reachable from a keyboard, and neither is a
+    // trackpad without a second button configured. The context-menu key
+    // and Shift+F10 are what those users press instead.
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+        e.preventDefault();
+        const box = btn.getBoundingClientRect();
+        openMenu(box.left + 24, box.bottom - 8, t);
+      }
+    });
     li.append(btn);
     dividersEl.append(li);
   });

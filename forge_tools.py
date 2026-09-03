@@ -1764,6 +1764,17 @@ def last_trace_id() -> str | None:
     return getattr(_last_trace, "value", None)
 
 
+def reset_trace_id() -> None:
+    """Forget the id from the previous call on this thread.
+
+    Server threads are reused. Without this, a turn whose provider runs its
+    tools out of process (the Claude Code CLI calls them over MCP) would
+    find the id left behind by an earlier, unrelated turn that did run one
+    in process -- and attach a browser to somebody else's execution trace.
+    """
+    _last_trace.value = None
+
+
 def openai_tools() -> list[dict]:
     """Tool schemas in the OpenAI/Groq `tools=[...]` format."""
     return [
@@ -1785,7 +1796,7 @@ def openai_tools() -> list[dict]:
 _TARGET_KEYS = ("url", "name", "query", "technology", "section", "path", "out_dir")
 
 
-def _target_of(arguments: dict) -> str:
+def target_of(arguments: dict) -> str:
     for key in _TARGET_KEYS:
         value = (arguments or {}).get(key)
         if isinstance(value, str) and value.strip():
@@ -1816,7 +1827,7 @@ def run_tool(name: str, arguments: dict[str, Any]) -> str:
 
     allowed = set((tool.schema.get("properties") or {}).keys())
     kwargs = {k: v for k, v in (arguments or {}).items() if k in allowed}
-    call = ctx.stage(name, target=_target_of(kwargs), metadata=dict(kwargs))
+    call = ctx.stage(name, target=target_of(kwargs), metadata=dict(kwargs))
     inner = call.start(f"called {name}")
 
     try:

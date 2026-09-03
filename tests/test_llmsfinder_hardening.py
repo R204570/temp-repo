@@ -448,3 +448,80 @@ def test_a_partial_dump_with_many_citations_stays_hybrid():
     assert 0.03 <= density < 0.5, f"density {density:.3f} must sit in the hybrid window"
 
     assert llmsfinder.classify_llms_shape(body) == "hybrid"
+
+
+# ── Never broaden a scoped request, version or not ──────────────────
+# docs.modular.com publishes one llms.txt for Modular Cloud. A request for
+# /mojo/ was answered with API-key and billing documentation: nothing about
+# that is version-specific, so `_asks_for_a_version` never fired and the
+# site-wide file was used unchallenged.
+def test_a_site_wide_manifest_covering_another_product_is_refused():
+    manifest = ("# Modular Cloud\n\n> Cloud infrastructure docs.\n\n"
+                + "\n".join(f"- [Admin {i}](https://d.dev/administration/{i}/)"
+                            for i in range(6)))
+    sitemap = ("<urlset>"
+               + "".join(f"<url><loc>https://d.dev/mojo/p{i}</loc></url>" for i in range(3))
+               + "</urlset>")
+    pages = {
+        "https://d.dev/llms.txt": FakeResponse(manifest),
+        "https://d.dev/sitemap.xml": FakeResponse(sitemap, ctype="application/xml"),
+        "https://d.dev/mojo/p0": FakeResponse(_page("P0")),
+        "https://d.dev/mojo/p1": FakeResponse(_page("P1")),
+        "https://d.dev/mojo/p2": FakeResponse(_page("P2")),
+    }
+    fetcher = FakeFetcher(pages)
+    docs, strategy = df.harvest("https://d.dev/mojo/", fetcher=fetcher, stats={})
+
+    assert strategy == "sitemap", "the manifest documents another product"
+    assert [d.url for d in docs] == ["https://d.dev/mojo/p0",
+                                     "https://d.dev/mojo/p1",
+                                     "https://d.dev/mojo/p2"]
+    assert not any("/administration/" in d.url for d in docs)
+
+
+def test_a_site_wide_manifest_is_narrowed_when_it_does_cover_the_scope():
+    """Refusal is the last resort, not the reflex: a manifest that lists
+    pages under the requested prefix is used, minus everything else."""
+    manifest = ("# Everything\n\n> All products.\n\n"
+                + "- [Cloud](https://d.dev/administration/keys/)\n"
+                + "- [Mojo A](https://d.dev/mojo/a/)\n"
+                + "- [Mojo B](https://d.dev/mojo/b/)\n")
+    pages = {
+        "https://d.dev/llms.txt": FakeResponse(manifest),
+        "https://d.dev/mojo/a/": FakeResponse(_page("A")),
+        "https://d.dev/mojo/b/": FakeResponse(_page("B")),
+    }
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    docs, _ = df.harvest("https://d.dev/mojo/", fetcher=fetcher, stats=stats)
+
+    assert sorted(d.url for d in docs) == ["https://d.dev/mojo/a/", "https://d.dev/mojo/b/"]
+    assert stats["expected"] == 2
+    assert not any("/administration/" in u for u in fetcher.asked)
+
+
+def test_asking_for_the_whole_site_still_gets_the_published_file_in_one_request():
+    """The headline case must not become collateral damage: a request with
+    no section in it is not a scoped request, and still costs one fetch."""
+    dump = "# Complete Docs Dump\n\n" + ("Full documentation text. " * 200)
+    pages = {"https://d.dev/llms-full.txt": FakeResponse(dump)}
+    fetcher = FakeFetcher(pages)
+    docs, strategy = df.harvest("https://d.dev/", fetcher=fetcher, stats={})
+
+    assert strategy == "llms-full.txt"
+    assert len(docs) == 1
+    assert not any("sitemap" in u for u in fetcher.asked)
+
+
+def test_a_dump_is_still_used_for_a_scoped_request():
+    """A dump lists no pages, so it makes no checkable claim about what it
+    covers. Refusing on a suspicion nothing supports would trade a site's
+    whole published corpus for a crawl."""
+    dump = "# Complete Docs Dump\n\n" + ("Full documentation text. " * 200)
+    pages = {"https://d.dev/llms-full.txt": FakeResponse(dump)}
+    fetcher = FakeFetcher(pages)
+    docs, strategy = df.harvest("https://d.dev/docs/sub/page.html",
+                                fetcher=fetcher, stats={})
+
+    assert strategy == "llms-full.txt"
+    assert len(docs) == 1

@@ -1043,6 +1043,32 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
     return [Doc(det.url, "llms.txt", _meta_header(det.url, "llms.txt") + body)]
 
 
+def _manifest_links_under(prefix: str, det: "Detection", fetcher: Fetcher
+                          ) -> tuple[list[tuple[str, str]] | None, int]:
+    """The manifest's links whose own path sits under `prefix`, and how many
+    it published in total.
+
+    `(None, 0)` means there was nothing to filter: a dump publishes prose,
+    not a list of pages, so it makes no checkable claim about what it covers.
+    That is different from `([], n)` — a manifest that listed n pages and put
+    none of them under `prefix` has said, checkably, that it is about
+    something else.
+    """
+    body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
+    body = body.strip()
+    if llmsfinder.classify_llms_shape(body) not in ("index", "hybrid"):
+        return None, 0
+
+    links = llmsfinder.parse_llms_links(body, det.url)
+    scoped = []
+    for title, link in links:
+        path = urlparse(link).path
+        path = path if path.endswith("/") else path + "/"
+        if path.startswith(prefix):
+            scoped.append((title, link))
+    return scoped, len(links)
+
+
 def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
                             ) -> list[tuple[str, str]] | None:
     """Manifest links safely identifiable as belonging to the version `url`
@@ -1065,20 +1091,63 @@ def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
     prefix_parts = [p for p in prefix.split("/") if p]
     if not prefix_parts or not _VERSION.match(prefix_parts[-1]):
         return None
-
-    body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
-    body = body.strip()
-    if llmsfinder.classify_llms_shape(body) not in ("index", "hybrid"):
-        return None
-
-    links = llmsfinder.parse_llms_links(body, det.url)
-    scoped = []
-    for title, link in links:
-        path = urlparse(link).path
-        path = path if path.endswith("/") else path + "/"
-        if path.startswith(prefix):
-            scoped.append((title, link))
+    scoped, _total = _manifest_links_under(prefix, det, fetcher)
     return scoped or None
+
+
+def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
+                          opts: Options) -> tuple[bool, list[tuple[str, str]] | None]:
+    """What a site-wide `llms.txt` may contribute to a request scoped below it.
+
+    Returns `(skip, restrict_links)`:
+
+        (False, None)     use the file as published
+        (False, [...])    use it, but only these entries
+        (True,  None)     do not use it at all; fall down the ladder
+
+    This is the version pass's invariant restated without the word
+    "version": **never broaden a scoped request.** `docs.modular.com` is
+    the case that showed the original wording was too narrow. It publishes
+    one `llms.txt` for Modular Cloud, so a request for `/mojo/` came back
+    as API-key and billing documentation — nothing about that is
+    version-specific, the file simply documents another product on the same
+    host, and `_asks_for_a_version` had no reason to fire.
+
+    What makes the refusal a finding rather than a guess is that the
+    manifest is checked against the request instead of assumed about. A
+    manifest that lists pages and puts none of them under the requested
+    prefix has demonstrated what it covers. A dump lists no pages, makes no
+    such claim, and is used as published — trading a site's whole published
+    corpus for a crawl on a suspicion nothing supports would cost far more
+    than it saves.
+    """
+    if not _probed_at_the_root(url, det):
+        return False, None          # the caller pointed at this file itself
+    prefix = docs_scope(url)
+    if prefix == "/":
+        return False, None          # the whole site is what was asked for
+
+    #: A version request keeps refusing on any doubt: two releases of one
+    #: library contradict each other, so an unverifiable manifest is worse
+    #: than a slower crawl. An ordinary scoped request has no such stake.
+    versioned = _asks_for_a_version(url)
+
+    if det.kind != "llms_txt":
+        return versioned, None      # another strategy's artifact is all-or-nothing
+
+    try:
+        scoped, total = _manifest_links_under(prefix, det, fetcher)
+    except ForgeError:
+        return versioned, None
+
+    if scoped is None:              # a dump: nothing checkable either way
+        return versioned, None
+    if scoped:
+        return False, scoped
+
+    _log(opts, f"  the site-wide {det.url.rsplit('/', 1)[-1]} lists {total} page(s) "
+               f"and none under {prefix} — it documents something else")
+    return True, None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2400,25 +2469,15 @@ def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = Non
             # version. If the manifest itself can prove which of its entries
             # belong to that version, use just those; otherwise crawl the
             # version they named instead.
-            restrict_links = None
-            skip_llms = False
-            if _asks_for_a_version(url) and _probed_at_the_root(url, det):
-                skip_llms = True
-                if det.kind == "llms_txt":
-                    try:
-                        restrict_links = _llms_txt_version_scope(url, det, fetcher)
-                    except ForgeError:
-                        restrict_links = None
-                    if restrict_links is not None:
-                        skip_llms = False
+            skip_llms, restrict_links = _scope_site_wide_llms(url, det, fetcher, opts)
 
             if skip_llms:
-                _log(opts, "  ignoring the site-wide llms.txt: "
-                           "the URL asks for one version of the docs")
+                _log(opts, "  ignoring the site-wide llms.txt: it does not cover "
+                           "the section this URL asks for")
             else:
                 if restrict_links is not None:
-                    _log(opts, f"  scoping the site-wide llms.txt to the requested "
-                               f"version ({len(restrict_links)} manifest page(s))")
+                    _log(opts, f"  scoping the site-wide llms.txt to {docs_scope(url)} "
+                               f"({len(restrict_links)} manifest page(s))")
                 _log(opts, f"  harvesting via {det.kind}")
                 try:
                     if det.kind == "llms_txt":
