@@ -985,11 +985,12 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                     restrict_links: list[tuple[str, str]] | None = None) -> list[Doc]:
     """Acquire documentation from a detected llms.txt / llms-full.txt source.
 
-    `restrict_links` is set by `harvest()` when the caller asked for one
-    version of the docs and the manifest could be safely filtered to it
-    (see `_llms_txt_version_scope`). When present it replaces whatever
-    `parse_llms_links()` would find in the body, so acquisition only ever
-    touches pages already proven to belong to that version.
+    `restrict_links` is set by `harvest()` when the published file is not
+    what the caller asked for but part of it is — one release out of
+    several, or one section of a site (see `_scope_site_wide_llms`). When
+    present it replaces whatever `parse_llms_links()` would find in the
+    body, so acquisition only ever touches pages already shown to belong to
+    what was asked for.
     """
     body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
     body = body.strip()
@@ -1012,6 +1013,23 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
         if excluded:
             _log(opts, f"  excluded {excluded} off-site manifest link(s) from the expected count")
 
+        # `max_pages` means "deliberately cut this harvest short", and the
+        # manifest path used to be the one strategy that ignored it: asking
+        # for ten pages of a 229-page manifest fetched all 229, and reported
+        # nothing about having done so. `promised` stays the site's own
+        # count so the coverage figure is still measured against what
+        # exists, while `truncated` is what makes the shortfall speak.
+        promised = len(links)
+        cap = opts.limit()
+        over = 0 if cap is None else max(0, promised - cap)
+        if over:
+            links = links[:cap]
+            _log(opts, f"  stopping at the {cap}-page limit: the manifest lists "
+                       f"{promised}, so {over} are left unfetched")
+        if stats is not None:
+            stats["truncated"] = over > 0
+            stats["remaining"] = over
+
         if shape == "hybrid":
             # A hybrid manifest promises two different things: its own root
             # prose (already in hand as `body`) and whatever pages its links
@@ -1031,7 +1049,10 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
             if not keep_root:
                 _log(opts, "  dropping the root document: the manifest was narrowed, "
                            "and its own prose is not what was asked for")
-            expected_count = len(links)
+            # Measured against what the site says exists, not against the
+            # slice a page limit left behind — otherwise cutting a harvest
+            # short would make it *look* complete.
+            expected_count = promised
             root_count = 1 if keep_root else 0
             _publish_denominator(stats, fetcher, expected_count + root_count,
                                  expected_count, root_count)
@@ -1049,7 +1070,10 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                 stats["failed"] = failed_count
                 stats["failed_urls"] = failed
                 stats["whole"] = is_whole
-                if not is_whole:
+                if not is_whole and not over:
+                    # A truncated harvest is already explained by the page
+                    # limit; calling those pages "could not be acquired"
+                    # would blame the site for the caller's own bound.
                     stats["reason"] = (
                         f"{'hybrid root document stored, but ' if keep_root else ''}"
                         f"{failed_count} of {expected_count} "
@@ -1060,7 +1084,9 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
 
         # shape == "index"
         if links:
-            expected_count = len(links)
+            # As above: the denominator is the site's own count, so a page
+            # limit shows up as a shortfall rather than as completeness.
+            expected_count = promised
             _publish_denominator(stats, fetcher, expected_count, expected_count, 0)
 
             docs, failed = _acquire_manifest_links(links, fetcher, opts)
@@ -1076,7 +1102,7 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                 stats["failed"] = failed_count
                 stats["failed_urls"] = failed
                 stats["whole"] = is_whole
-                if not is_whole:
+                if not is_whole and not over:
                     stats["reason"] = (
                         f"manifest declared {expected_count} unique pages, but {failed_count} "
                         f"could not be acquired"
@@ -1135,51 +1161,6 @@ def _links_for_release(links: list[tuple[str, str]], asked: str) -> list[tuple[s
                 break
     return out
 
-
-def _manifest_links_under(prefix: str, det: "Detection", fetcher: Fetcher
-                          ) -> tuple[list[tuple[str, str]] | None, int]:
-    """The manifest's links whose own path sits under `prefix`, and how many
-    it published in total.
-
-    `(None, 0)` means there was nothing to filter: a dump publishes prose,
-    not a list of pages, so it makes no checkable claim about what it covers.
-    That is different from `([], n)` — a manifest that listed n pages and put
-    none of them under `prefix` has said, checkably, that it is about
-    something else.
-    """
-    body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
-    body = body.strip()
-    if llmsfinder.classify_llms_shape(body) not in ("index", "hybrid"):
-        return None, 0
-
-    links = llmsfinder.parse_llms_links(body, det.url)
-    return _links_under(links, prefix), len(links)
-
-
-def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
-                            ) -> list[tuple[str, str]] | None:
-    """Manifest links safely identifiable as belonging to the version `url`
-    names, or None when the manifest cannot be scoped that way.
-
-    Reuses `docs_scope()` — the same version-anchored prefix the crawl path
-    already stays inside — instead of inventing a second way to detect a
-    version. A link only survives if its own path starts with that exact
-    prefix, so this can narrow a site-wide manifest down to one version but
-    can never admit another version into it: the worst it can do wrong is
-    return too little, never too much.
-
-    None means there is nothing reliable to filter by: the request's own
-    prefix does not end on a version segment, the manifest is a dump with no
-    per-page URLs to check it against, or filtering leaves nothing. Either
-    way the caller should fall back to the version-scoped crawler instead of
-    trusting a manifest that cannot prove it is scoped.
-    """
-    prefix = docs_scope(url)
-    prefix_parts = [p for p in prefix.split("/") if p]
-    if not prefix_parts or not _VERSION.match(prefix_parts[-1]):
-        return None
-    scoped, _total = _manifest_links_under(prefix, det, fetcher)
-    return scoped or None
 
 
 def _requested_release(url: str, opts: Options) -> str:
@@ -1865,11 +1846,6 @@ def docs_scope(url: str) -> str:
     # No recognisable docs root: stay in the start page's own folder.
     folder = parts[:-1] if "." in parts[-1] or len(parts) > 1 else parts
     return "/" + "/".join(folder) + "/" if folder else "/"
-
-
-def _asks_for_a_version(url: str) -> bool:
-    """Does this URL name a particular version of the documentation?"""
-    return any(_VERSION.match(p) for p in urlparse(url).path.split("/") if p)
 
 
 def _probed_at_the_root(url: str, det: Detection) -> bool:

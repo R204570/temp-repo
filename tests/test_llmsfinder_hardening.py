@@ -72,6 +72,16 @@ def _page(title):
 
 
 # ── 1. Version-aware LLMS acquisition ─────────────────────────
+# These two used to call `_llms_txt_version_scope`, which the two-pathway
+# split left with no production caller — so they passed while exercising
+# code nothing ran. They now go through `_scope_site_wide_llms`, which is
+# what `harvest()` actually calls, and assert the same two behaviours.
+def _decision(url, body, version=""):
+    det = df.Detection("llms_txt", "https://x.dev/llms.txt", body)
+    opts = df.Options(verbose=False, delay=0.0, version=version)
+    return df._scope_site_wide_llms(url, det, FakeFetcher({}), opts)
+
+
 def test_version_scope_multi_version_manifest_is_filtered():
     """Case B: a manifest that mixes versions can be safely narrowed."""
     body = "# Docs\n\n" + "\n".join([
@@ -80,19 +90,20 @@ def test_version_scope_multi_version_manifest_is_filtered():
         "- [V2 B](https://x.dev/docs/v2/b.md)",
         "- [V3 A](https://x.dev/docs/v3/a.md)",
     ])
-    det = df.Detection("llms_txt", "https://x.dev/llms.txt", body)
-    scoped = df._llms_txt_version_scope("https://x.dev/docs/v2/", det, FakeFetcher({}))
+    skip, scoped = _decision("https://x.dev/docs/v2/", body)
+    assert skip is False
     urls = sorted(u for _t, u in scoped)
     assert urls == ["https://x.dev/docs/v2/a.md", "https://x.dev/docs/v2/b.md"]
 
 
-def test_version_scope_ambiguous_manifest_returns_none():
-    """Case A: a manifest with no version signal cannot be safely scoped."""
+def test_version_scope_ambiguous_manifest_is_refused():
+    """Case A: a manifest with no version signal cannot be safely scoped,
+    so the release pathway refuses it rather than guessing."""
     body = "# Docs\n\n" + "\n".join(
         f"- [Page {i}](https://x.dev/docs/page{i}.md)" for i in range(10)
     )
-    det = df.Detection("llms_txt", "https://x.dev/llms.txt", body)
-    scoped = df._llms_txt_version_scope("https://x.dev/docs/v2/", det, FakeFetcher({}))
+    skip, scoped = _decision("https://x.dev/docs/v2/", body)
+    assert skip is True
     assert scoped is None
 
 
@@ -723,3 +734,55 @@ def test_an_unnarrowed_hybrid_still_keeps_its_root():
     assert any("Root prose worth keeping" in d.markdown for d in docs)
     assert stats["expected"] == 3
     assert stats["discovered"] == 4, "the root is counted alongside the three links"
+
+
+# ── The caller's page limit binds this strategy too ─────────────────
+# `max_pages` is documented as "set a number only to deliberately cut a
+# harvest short". Every strategy honoured it except this one: asking for
+# ten pages of a 120-page manifest fetched all 120 and said nothing.
+def _manifest_of(n):
+    pages = {"https://d.dev/llms.txt":
+             FakeResponse("# Index\n\n" + "\n".join(
+                 f"- [P{i}](https://d.dev/p{i}.md)" for i in range(n)))}
+    for i in range(n):
+        pages[f"https://d.dev/p{i}.md"] = FakeResponse(f"# P{i}")
+    return pages
+
+
+def test_a_page_limit_actually_stops_a_manifest_harvest():
+    fetcher = FakeFetcher(_manifest_of(120))
+    opts = df.Options(verbose=False, delay=0.0, max_pages=10)
+    stats = {}
+    docs, _ = df.harvest("https://d.dev/llms.txt", opts, fetcher=fetcher, stats=stats)
+
+    assert len(docs) == 10, "the caller asked for ten"
+    assert len([u for u in fetcher.asked if u.endswith(".md")]) == 10, "and ten were fetched"
+
+
+def test_a_truncated_manifest_never_looks_complete():
+    """The denominator stays the site's own count, so cutting a harvest
+    short shows up as a shortfall instead of as success."""
+    fetcher = FakeFetcher(_manifest_of(120))
+    opts = df.Options(verbose=False, delay=0.0, max_pages=10)
+    stats = {}
+    df.harvest("https://d.dev/llms.txt", opts, fetcher=fetcher, stats=stats)
+
+    assert stats["expected"] == 120, "what the site says exists"
+    assert stats["acquired"] == 10
+    assert stats["whole"] is False
+    assert stats["truncated"] is True
+    assert stats["remaining"] == 110
+    # The shortfall is the caller's own limit, not the site failing.
+    assert stats["failed"] == 0
+    assert "could not be acquired" not in stats.get("reason", "")
+
+
+def test_no_page_limit_still_takes_the_whole_manifest():
+    fetcher = FakeFetcher(_manifest_of(30))
+    opts = df.Options(verbose=False, delay=0.0, max_pages=0)
+    stats = {}
+    docs, _ = df.harvest("https://d.dev/llms.txt", opts, fetcher=fetcher, stats=stats)
+
+    assert len(docs) == 30
+    assert stats["truncated"] is False
+    assert stats["whole"] is True
