@@ -912,6 +912,30 @@ def _categorize_failure(exc: Exception) -> str:
     return "invalid_response"
 
 
+def _publish_denominator(stats: dict | None, fetcher: Fetcher, discovered: int,
+                         expected: int, already_in_hand: int) -> None:
+    """Say how many pages are promised *before* fetching them, not after.
+
+    A published manifest is the one strategy that knows its exact
+    denominator up front — that is the whole reason its coverage claim is
+    stronger than a sitemap's. Writing it only once the fetching finished
+    threw that away for the entire time it would have been useful: a
+    229-page harvest showed "fetched 40 pages" for ten minutes when it
+    could have said "40/229".
+
+    `already_in_hand` is documents obtained before the loop starts — a
+    hybrid's root prose, which arrived with the manifest itself — counted
+    now so the progress figure and the denominator describe the same set.
+    """
+    if stats is not None:
+        stats.setdefault("expected", expected)
+        stats["discovered"] = discovered
+    note_page = getattr(fetcher, "page_fetched", None)
+    if callable(note_page):
+        for _ in range(already_in_hand):
+            note_page()
+
+
 def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
                             opts: Options) -> tuple[list[Doc], list[dict]]:
     """Fetch every manifest link, keeping successes and failures apart.
@@ -926,11 +950,24 @@ def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
     """
     docs: list[Doc] = []
     failed: list[dict] = []
+    #: Optional, duck-typed like `sink`: a fetcher that wants to report
+    #: progress says so by having this. A Markdown twin is fetched with
+    #: `text()`, which no progress counter can hook the way it hooks
+    #: `html()` -- `text()` also fetches manifests, robots.txt and sitemaps,
+    #: and counting those as pages would inflate the very number the
+    #: coverage claim rests on. So the acquisition loop, which is the one
+    #: place that knows a *documentation page* was just obtained, says so.
+    note_page = getattr(fetcher, "page_fetched", None)
+
     for title, link_url in links:
         try:
             if llmsfinder.is_markdown_link(link_url):
                 text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
                 docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
+                if callable(note_page):
+                    # Only here: the branch below goes through `html()`,
+                    # which such a fetcher already counts for itself.
+                    note_page()
             else:
                 doc_title, md = _extract_page(link_url, fetcher, opts)
                 docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
@@ -980,33 +1017,53 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
             # prose (already in hand as `body`) and whatever pages its links
             # describe. The two are recorded separately so root success can
             # never stand in for corpus completeness.
+            #
+            # The root is dropped whenever the links were narrowed. A caller
+            # narrows because the file as published is not what was asked
+            # for -- it is the current release when another was named, or a
+            # whole site when one section was -- and only the named subset
+            # survived that judgement. The root prose is the part that did
+            # not, so storing it anyway would put back exactly the content
+            # discovery had just refused, under the name of the thing that
+            # was asked for.
+            keep_root = restrict_links is None
             root_doc = Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)
-            docs, failed = _acquire_manifest_links(links, fetcher, opts)
+            if not keep_root:
+                _log(opts, "  dropping the root document: the manifest was narrowed, "
+                           "and its own prose is not what was asked for")
             expected_count = len(links)
+            root_count = 1 if keep_root else 0
+            _publish_denominator(stats, fetcher, expected_count + root_count,
+                                 expected_count, root_count)
+
+            docs, failed = _acquire_manifest_links(links, fetcher, opts)
             acquired_count = len(docs)
             failed_count = len(failed)
             is_whole = acquired_count == expected_count
 
             if stats is not None:
                 stats["expected"] = expected_count
-                stats["discovered"] = expected_count + 1
+                stats["discovered"] = expected_count + root_count
                 stats["acquired"] = acquired_count
-                stats["fetched"] = acquired_count + 1
+                stats["fetched"] = acquired_count + root_count
                 stats["failed"] = failed_count
                 stats["failed_urls"] = failed
                 stats["whole"] = is_whole
                 if not is_whole:
                     stats["reason"] = (
-                        f"hybrid root document stored, but {failed_count} of {expected_count} "
+                        f"{'hybrid root document stored, but ' if keep_root else ''}"
+                        f"{failed_count} of {expected_count} "
                         f"manifest linked pages could not be acquired"
                     )
 
-            return [root_doc] + docs
+            return ([root_doc] + docs) if keep_root else docs
 
         # shape == "index"
         if links:
-            docs, failed = _acquire_manifest_links(links, fetcher, opts)
             expected_count = len(links)
+            _publish_denominator(stats, fetcher, expected_count, expected_count, 0)
+
+            docs, failed = _acquire_manifest_links(links, fetcher, opts)
             acquired_count = len(docs)
             failed_count = len(failed)
             is_whole = (acquired_count == expected_count and expected_count > 0)

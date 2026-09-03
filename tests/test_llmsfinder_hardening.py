@@ -646,3 +646,80 @@ def test_an_unorderable_label_answers_nothing():
     assert V.same_release("1.10", "2.11") is False
     assert V.same_release("1.10", "latest") is False
     assert V.same_release("latest", "1.10") is False
+
+
+# ── A narrowed manifest must not smuggle its own root back in ───────
+# Narrowing says "the file as published is not what was asked for; only
+# this subset of it is". The root prose is part of what was refused, so
+# storing it anyway put the rejected content into the corpus under the
+# name of the thing that WAS asked for -- silently undoing the refusal.
+def _versioned_hybrid():
+    return ("# Docs\n\n> summary\n\n"
+            + ("CURRENT RELEASE 2.11 PROSE. " * 60) + "\n\n"
+            + "- [Old](https://d.dev/docs/1.9/a.md)\n"
+            + "- [Want A](https://d.dev/docs/1.10/a.md)\n"
+            + "- [Want B](https://d.dev/docs/1.10/b.md)\n"
+            + "- [New](https://d.dev/docs/2.11/a.md)\n")
+
+
+def test_narrowing_to_a_release_drops_the_current_release_root():
+    pages = {
+        "https://d.dev/llms.txt": FakeResponse(_versioned_hybrid()),
+        "https://d.dev/docs/1.10/a.md": FakeResponse("# A 1.10"),
+        "https://d.dev/docs/1.10/b.md": FakeResponse("# B 1.10"),
+    }
+    opts = df.Options(verbose=False, delay=0.0, version="1.10")
+    stats = {}
+    docs, _ = df.harvest("https://d.dev/docs/", opts,
+                         fetcher=FakeFetcher(pages), stats=stats)
+
+    assert sorted(d.url for d in docs) == ["https://d.dev/docs/1.10/a.md",
+                                           "https://d.dev/docs/1.10/b.md"]
+    assert not any("CURRENT RELEASE 2.11" in d.markdown for d in docs)
+    # The counts follow the documents: no root stored, no root counted.
+    assert stats["expected"] == 2
+    assert stats["discovered"] == 2
+    assert stats["fetched"] == 2
+    assert stats["whole"] is True
+
+
+def test_narrowing_to_a_section_drops_the_other_products_root():
+    """The docs.modular.com shape: one file covering the whole platform,
+    a request for one section of it."""
+    body = ("# Modular Cloud\n\n> summary\n\n"
+            + ("CLOUD BILLING AND API KEY PROSE. " * 60) + "\n\n"
+            + "- [Admin](https://d.dev/administration/keys/)\n"
+            + "- [Mojo A](https://d.dev/mojo/a/)\n"
+            + "- [Mojo B](https://d.dev/mojo/b/)\n")
+    pages = {
+        "https://d.dev/llms.txt": FakeResponse(body),
+        "https://d.dev/mojo/a/": FakeResponse(_page("A")),
+        "https://d.dev/mojo/b/": FakeResponse(_page("B")),
+    }
+    docs, _ = df.harvest("https://d.dev/mojo/", fetcher=FakeFetcher(pages), stats={})
+
+    assert sorted(d.url for d in docs) == ["https://d.dev/mojo/a/", "https://d.dev/mojo/b/"]
+    assert not any("CLOUD BILLING" in d.markdown for d in docs)
+
+
+def test_an_unnarrowed_hybrid_still_keeps_its_root():
+    """The root is dropped because it was refused, not because narrowing
+    exists. A file taken as published still contributes its own prose."""
+    body = ("# Docs\n\n> summary\n\n" + ("Root prose worth keeping. " * 60) + "\n\n"
+            + "- [A](https://d.dev/a.md)\n- [B](https://d.dev/b.md)\n"
+            + "- [C](https://d.dev/c.md)\n")
+    pages = {
+        "https://d.dev/llms.txt": FakeResponse(body),
+        "https://d.dev/a.md": FakeResponse("# A"),
+        "https://d.dev/b.md": FakeResponse("# B"),
+        "https://d.dev/c.md": FakeResponse("# C"),
+    }
+    assert llmsfinder.classify_llms_shape(body) == "hybrid", "the case under test"
+
+    stats = {}
+    docs, _ = df.harvest("https://d.dev/llms.txt", fetcher=FakeFetcher(pages), stats=stats)
+
+    assert any(d.url.endswith("/llms.txt") for d in docs), "the root belongs here"
+    assert any("Root prose worth keeping" in d.markdown for d in docs)
+    assert stats["expected"] == 3
+    assert stats["discovered"] == 4, "the root is counted alongside the three links"
