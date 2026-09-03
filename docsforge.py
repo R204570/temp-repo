@@ -951,6 +951,16 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
 
     shape = llmsfinder.classify_llms_shape(body)
 
+    # Whatever shape it turns out to be, a file that states which release it
+    # documents has answered a question the URL usually cannot. Recorded
+    # here, once, for every branch below; what to do with it is the caller's
+    # decision, not this handler's.
+    if stats is not None:
+        declared = llmsfinder.declared_version(body)
+        if declared:
+            stats["declared_version"] = declared
+            _log(opts, f"  the manifest states it documents version {declared}")
+
     if shape in ("index", "hybrid"):
         raw_links = restrict_links if restrict_links is not None else llmsfinder.parse_llms_links(body, det.url)
         links, excluded = _classify_manifest_links(raw_links, det.url)

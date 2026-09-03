@@ -8,14 +8,17 @@ Covers, through the real `harvest()` path rather than isolated units:
   - failed-URL identity (category + normalized URL, for a future retry)
   - failure semantics (no manifest ever silently reported whole)
   - no redundant discovery once an LLMS rung has won
+  - the version a manifest declares about itself
 """
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import docsforge as df
+import llmsfinder
 
 
 class FakeResponse:
@@ -330,3 +333,118 @@ def test_no_redundant_discovery_after_index_manifest_success():
     assert stats["whole"] is True
     assert not any("sitemap" in u for u in fetcher.asked)
     assert not any("robots" in u for u in fetcher.asked)
+
+
+# ── Declared version: the manifest states what the URL cannot ────────
+# Found against the real mojolang.org harvest, which stored 1.1 MB of Mojo
+# 1.0.0 documentation under the label "2026-09-01" -- the date fallback that
+# exists to admit "no version could be established" -- while the file itself
+# said `Version: 1.0.0` in its first 200 bytes.
+def test_declared_version_is_read_from_the_header():
+    body = ("# Mojo programming language documentation\n\n"
+            "> Official documentation for the Mojo programming language.\n\n"
+            "Version: 1.0.0\n\n## Install Mojo\n\nprose\n")
+    assert llmsfinder.declared_version(body) == "1.0.0"
+
+
+def test_a_version_line_below_the_first_section_is_not_a_claim_about_the_file():
+    """Deep in the body, `Version:` is documentation *about* versions -- a
+    changelog entry or an install transcript -- not the file's own label."""
+    body = "# Docs\n\n> summary\n\n## Changelog\n\nVersion: 9.9.9\n\nolder notes\n"
+    assert llmsfinder.declared_version(body) == ""
+
+
+def test_a_manifest_that_states_nothing_yields_nothing():
+    assert llmsfinder.declared_version("# Docs\n\n> summary\n\n## A\n\nprose") == ""
+    assert llmsfinder.declared_version("") == ""
+
+
+def test_the_declared_version_reaches_stats_through_a_real_harvest():
+    body = ("# Docs\n\n> summary\n\nVersion: 2.4.1\n\n"
+            + "\n".join(f"- [Page {i}](https://x.dev/p{i}.md)" for i in range(3)))
+    pages = {"https://x.dev/llms.txt": FakeResponse(body)}
+    for i in range(3):
+        pages[f"https://x.dev/p{i}.md"] = FakeResponse(f"# Page {i}")
+
+    stats = {}
+    df.harvest("https://x.dev/llms.txt", fetcher=FakeFetcher(pages), stats=stats)
+    assert stats["declared_version"] == "2.4.1"
+
+
+def test_a_declared_release_replaces_the_date_but_a_vague_label_does_not():
+    import forge_tools as ft
+
+    docs = [df.Doc("https://x.dev/a", "A", "")]
+    today = time.strftime("%Y-%m-%d")
+
+    # No version in the URL: the date is all the URL can offer.
+    assert ft._version_label("https://x.dev/llms.txt", docs) == today
+    # A real release number is a better answer than the date.
+    assert ft._version_label("https://x.dev/llms.txt", docs, "1.0.0") == "1.0.0"
+    # "latest" is not. It says no more than the fallback it would replace,
+    # so the honest admission stays.
+    assert ft._version_label("https://x.dev/llms.txt", docs, "latest") == today
+    assert ft._version_label("https://x.dev/llms.txt", docs, "stable") == today
+
+
+def test_a_version_in_the_url_still_wins_over_one_the_file_declares():
+    """The URL is what the caller asked for. A site-wide file's own label
+    must not quietly relabel a harvest the caller scoped to one version."""
+    import forge_tools as ft
+
+    docs = [df.Doc("https://x.dev/docs/v3/a", "A", ""),
+            df.Doc("https://x.dev/docs/v3/b", "B", "")]
+    assert ft._version_label("https://x.dev/docs/v3/", docs, "9.9.9") == "v3"
+
+
+# ── The coverage denominator counts documentation, not citations ─────
+def test_off_site_citations_are_excluded_from_the_expected_count():
+    """The mojo harvest recorded `expected: 435` -- 434 links plus a root --
+    and so reported INCOMPLETE for failing to fetch Wikipedia and YouTube.
+    Only pages this harvest intends to acquire may set the denominator."""
+    body = ("# Docs\n\n> summary\n\n"
+            + ("Substantial prose that makes this a hybrid rather than an index. " * 40)
+            + "\n\n- [Real page](https://x.dev/a.md)\n"
+            + "- [Also real](https://x.dev/b.md)\n"
+            + "- [Wikipedia](https://en.wikipedia.org/wiki/Thing)\n"
+            + "- [A talk](https://www.youtube.com/watch?v=abc)\n")
+    pages = {
+        "https://x.dev/llms.txt": FakeResponse(body),
+        "https://x.dev/a.md": FakeResponse("# A"),
+        "https://x.dev/b.md": FakeResponse("# B"),
+    }
+    fetcher = FakeFetcher(pages)
+    stats = {}
+    df.harvest("https://x.dev/llms.txt", fetcher=fetcher, stats=stats)
+
+    assert stats["expected"] == 2, "only the two same-host pages were promised"
+    assert stats["acquired"] == 2
+    assert stats["whole"] is True, "acquiring everything promised is complete"
+    # Never reached for, so never counted as missing.
+    assert not any("wikipedia" in u for u in fetcher.asked)
+    assert not any("youtube" in u for u in fetcher.asked)
+
+
+def test_a_partial_dump_with_many_citations_stays_hybrid():
+    """Regression guard for a fix that would have been wrong.
+
+    mojolang.org/llms-full.txt is 1.1 MB with 434 links, and the obvious
+    reading is "a dump misclassified as a hybrid". It is not: 155 of its 213
+    same-host linked pages hold content the dump does not, so calling it a
+    dump would silently discard them. Size alone must never override the
+    shape, or a partial dump stops being followed."""
+    body = ("# Big docs\n\n> summary\n\n"
+            + ("Real documentation prose, paragraphs of it, the manual itself. " * 3000)
+            + "\n\n"
+            + "\n".join(f"- [Further page {i}](https://x.dev/docs/section/{i}/)"
+                        for i in range(250)))
+
+    # Shaped like the real thing: megabyte-scale prose whose citations sit
+    # squarely inside the hybrid density window, which is exactly why size
+    # cannot be used to overrule it.
+    link_chars = sum(len(l) for l in body.splitlines() if llmsfinder._LINK_RE.search(l))
+    density = link_chars / len(body)
+    assert len(body) > 180_000, "large enough that a naive size rule would fire"
+    assert 0.03 <= density < 0.5, f"density {density:.3f} must sit in the hybrid window"
+
+    assert llmsfinder.classify_llms_shape(body) == "hybrid"

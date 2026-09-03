@@ -30,6 +30,7 @@ import applog
 import harvest_jobs
 import reasoning
 import tracing
+import versions
 
 # Cap what we hand back to a model — docs sites can be enormous and blowing the
 # context window helps nobody.
@@ -228,7 +229,7 @@ def tool_save_docs(url: str, out_dir: str = "docs_md", crawl: bool = False,
 # ─────────────────────────────────────────────────────────────
 # Schemas (JSON Schema, shared by MCP and Groq)
 # ─────────────────────────────────────────────────────────────
-def _version_label(url: str, docs: list[Doc]) -> str:
+def _version_label(url: str, docs: list[Doc], declared: str = "") -> str:
     """What to call this harvest, checked against what it actually collected.
 
     A start URL like `/docs/validation/2.11/get-started/` names a version, but
@@ -236,10 +237,21 @@ def _version_label(url: str, docs: list[Doc]) -> str:
     are published once for the whole site, so filing their output under "2.11"
     would claim a precision the content does not have. Trust the URL's label
     only when the pages that came back live under it.
+
+    `declared` is what the source said about itself — an `llms.txt` header's
+    `Version:` line. It is consulted only where the URL named nothing, and
+    only when it is a real release number: the date fallback exists to admit
+    "we could not establish a version", and replacing it with "latest" or
+    "stable" would dress that admission up as an answer without adding one.
     """
     label = _version_from_url(url)
     if label == time.strftime("%Y-%m-%d"):
-        return label  # nothing to check: the URL named no version
+        # The URL named no version. A file that states its own outranks the
+        # day we happened to fetch it -- that is the whole ordering in
+        # versions.py, applied one step earlier.
+        if declared and versions.kind(declared) == versions.RELEASE:
+            return _kb_slug(declared)
+        return label
 
     segment = f"/{label}/"
     carried = sum(1 for d in docs if segment in (d.url or "").lower())
@@ -326,7 +338,7 @@ def _reason_about_identity(name: str, url: str, body: str, reason: str) -> str:
     return ""
 
 
-def corpus_label(corpus, docs: list) -> str:
+def corpus_label(corpus, docs: list, declared: str = "") -> str:
     """What to file one corpus's harvest under.
 
     PROPOSAL-II §2.3: versions live on the corpus, because a specification is
@@ -337,7 +349,7 @@ def corpus_label(corpus, docs: list) -> str:
     """
     if corpus.version:
         return _kb_slug(corpus.version)
-    label = _version_label(corpus.url, docs)
+    label = _version_label(corpus.url, docs, declared)
     return "undated" if label == time.strftime("%Y-%m-%d") else label
 
 
@@ -397,7 +409,7 @@ def _harvest_corpus(technology: str, corpus, max_pages: int, js: bool) -> str:
         if not writer.titles:
             raise ForgeError(f"harvested nothing from {corpus.url}")
 
-        label = corpus_label(corpus, docs)
+        label = corpus_label(corpus, docs, stats.get("declared_version", ""))
         entry = writer.settle(complete=whole, expected=expected,
                               version=label, strategy=strategy)
         stored = len(writer.titles)
@@ -779,7 +791,8 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
 
         # v3 and v2 of the same library contradict each other, so they are
         # stored side by side rather than one overwriting the other.
-        label = _kb_slug(version) if version else _version_label(url, docs)
+        label = (_kb_slug(version) if version
+                 else _version_label(url, docs, stats.get("declared_version", "")))
         truncated = bool(stats.get("truncated"))
         # Completeness is measured, not assumed. `None` means the harvest never
         # established how much there was to get — which is not the same claim
