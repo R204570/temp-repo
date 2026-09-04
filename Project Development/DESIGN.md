@@ -114,6 +114,9 @@ than leaving you on a transcript that no longer exists anywhere.
   while running, then a tick or a bang, the target, the source kind and the
   character count. Shown rather than hidden, because an answer built from a
   page that was actually fetched should not look like one that was not.
+  **The whole row is the control.** It carries `aria-expanded` and a chevron
+  that rotates, and clicking anywhere on it opens the trace below — a row that
+  holds evidence and looks inert is worse than one that holds nothing.
 - **Answer actions** — Copy, Download .md, Edit, and Revert once edited. Edit
   swaps the rendered answer for a textarea; edited text is then shown as the
   plain text it now is rather than guessed at as HTML.
@@ -129,6 +132,36 @@ than leaving you on a transcript that no longer exists anywhere.
   needs a paragraph lives here.
 - **Footer line** — the one thing worth knowing before trusting an answer, and
   a link to `/docs` for everything else.
+
+## Execution trace
+
+Opened from a work row; nested under it, never in a separate panel that would
+divorce the evidence from the claim it supports.
+
+Each node is a stage or an event: a state glyph, a name, and — where there is
+one — the input it was given and the output it returned, each in a `<pre>` that
+scrolls inside itself. Nesting is by parent id and indents by depth, so a
+harvest reads as `learn_technology → resolving → harvesting → this page, that
+page` rather than a flat list of 230 lines.
+
+**Rows update in place.** Events are keyed by id, not appended, so a stage
+re-emitted with a new count replaces itself. Before that, a 211-page harvest
+painted 211 rows and the panel was unreadable exactly when it mattered most.
+
+Arrival is incremental over its own `EventSource` — the answer stream and the
+trace stream have different lifetimes, and a harvest that outlives the answer
+keeps emitting. Repaints target the turn that owns the trace rather than the
+last turn on screen, because a background harvest finishes while you are
+already reading the next answer.
+
+No new colour: `--accent` for a completed marker, `--danger` for a failed one,
+`--surface-2` for the panel fill, `--text-3` for an empty trace. A percentage
+appears only where the backend has a real denominator — a manifest length is
+one, a crawl frontier is not — so nothing here invents progress it cannot
+measure.
+
+Truncation is stated, never silent: strings clip at 4,000 characters and
+outputs at 20,000, and the row says how much it left out.
 
 ## Icons
 
@@ -172,6 +205,15 @@ version of it, and the pages of the version you open.
 - Actions appear in the top bar as they become possible rather than sitting
   greyed out: on this screen "nothing open yet" is the common state, and a row
   of dead controls is not information.
+- **Right-click a technology** for Open and *Delete all N versions*. Deleting
+  one version at a time was the only route to removing a technology, which is
+  not a route at all once it has eight of them. The destructive item **arms
+  before it fires** — it asks "Really delete everything?" and needs a second
+  click — and it sits in a context menu rather than on the row, because a
+  hover-revealed delete beside a whole language's documentation is too easy to
+  hit. The menu is repositioned after insertion so it never opens past the
+  viewport edge, and deleting whatever is currently open returns you to the
+  listing rather than to a detail pane for something that no longer exists.
 - The **storage chip** names which backend answered. Postgres ranks search and
   a folder of files cannot, so hiding which one you are reading would be a lie.
 
@@ -193,3 +235,9 @@ Every view is addressable: `#/effect/v3/41`.
   off the palette. Every text pair clears 4.5:1; the lowest are the placeholder
   at 5.24:1 and the send glyph on the accent at 4.87:1. Search highlight —
   accent on a 13% accent tint over near-black — measures 7.72:1.
+- The trace driven rather than eyeballed: a work row opens on click and on
+  `Enter`, `aria-expanded` tracks the panel, a stage re-emitted with the same id
+  replaces its row instead of adding one, and a harvest that finishes after the
+  next turn has started repaints its own turn rather than the last one on
+  screen. Backed by `tests/test_tracing.py`, `test_trace_integration.py` and
+  `test_app_trace.py`.

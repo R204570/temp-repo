@@ -88,6 +88,30 @@ unchanged**. The invariant forbids a *lower* bar; raising it is not forbidden bu
 is a deliberate change to a stated invariant, so it needs an explicit decision.
 Options, in increasing blast radius, are in `FINDINGS-C.md`.
 
+**Two feeder paths closed, without touching `is_identified()`.** Both were bugs
+in what counted as `own-domain`, not changes to how many signals are required,
+so Invariant 1 is untouched:
+
+- A domain probe that **redirected onto a code host** kept its ownership claim.
+  `mojo.dev` redirects to `github.com/gdejohn/procrastination` — a Java library,
+  since Maven plugins are also called "mojos" — and that plus a registry package
+  named `mojo` was two strong signals. The gate stamped `verified` on a page
+  that never says the word. `_owns_the_name` already refused forges outright;
+  arriving by redirect does not change who owns the host.
+- A language was refused a claim on the **`lang` domain it publishes from**.
+  Names that are common words take the suffix for exactly that reason, and
+  nothing probed them, so `zig` resolved to an npm templating library and `nim`
+  to an unrelated repository — both *verified*, each on a registry package that
+  agreed with itself.
+
+Measured after: `zig` → `ziglang.org`, `nim` → `nim-lang.org/documentation.html`,
+`mojo` → `mojolang.org`, each on `own-domain` plus mentions. **R1's own four
+survivors have not been re-measured**, and this does not claim them.
+
+What remains is what R1 has always been: a squatter that genuinely owns a
+hostname carrying the name, and says the name enough times. Neither fix reaches
+that.
+
 ### R2 — `_looks_like_software` is satisfied by a single footer forge link · open
 
 The gate meant to stop `astro` resolving to an astrology site. Almost every
@@ -121,6 +145,45 @@ exists for exactly this and is unconfigured).
 `tanstack.com` rather than the Query docs. `probe_docs_root` looks for a small
 set of conventional paths and `/doc/stable/` is not among them. Related to R3:
 the homepage verifies first and the loop stops.
+
+### R6 — a refusal this machine caused was filed as a fact about the name · **correctness** · fixed
+
+**Fixed** by `learned_nothing()`. `verify()` distinguishes two refusals and the
+cache did not: a candidate whose page was *read* and found to document something
+else is a real finding about the name; a candidate that could not be **fetched**
+says only that the network could not answer.
+
+Found by running a real resolution and getting `best: None, via: memory,
+candidates: 0` in one second. The cache held `mojo resolved=False age=12.1h
+"Found 6 candidate(s) but none could be confirmed"` — written during the NAT64
+outage, when every fetch was refused as a private address. `REJECT_TTL` is seven
+days; the cause was fixed within one. Six days of confident wrong answers, from
+one bad afternoon of networking.
+
+`remember()` now files nothing when every candidate was refused with
+`could not be read`. A partly-unreachable refusal is still remembered, because
+something was learned.
+
+### R7 — a fix could not reach the cache · **correctness** · fixed
+
+The sharper version of R6, and it bites *successes*. When R1's forge bug
+resolved `mojo` to a Java library, that answer was filed as a **success** — so
+`CACHE_TTL` would have served it for thirty days, outliving its own fix by four
+weeks, on the very name whose failure prompted the fix. `learn_technology`
+returned it in one second without a request.
+
+Found the same way both times: by looking at what a live run actually did rather
+than at whether the tests were green. They were.
+
+**Fixed** with a `RULES` stamp. An entry records which set of identity rules
+decided it, `recall` discards anything else, and entries written before the
+stamp existed carry no `rules` key and are discarded on sight — which is the
+intended effect, since every one of them predates two changes to those rules.
+Bump `RULES` whenever the gate changes.
+
+The general lesson, worth more than either fix: **a cache is a claim with a
+provenance, and code is part of that provenance.** Any TTL long enough to be
+useful is long enough to outlive the bug that wrote the entry.
 
 ---
 
@@ -178,6 +241,25 @@ mostly "404" or "not found", a body with no headings and little text), and that
 is a heuristic with a false-positive cost, so it wants measuring before it
 ships. A soft 404 counts toward `expected` and toward `complete`, so it inflates
 exactly the figure the product is built on.
+
+### E5 — the manifest path ignored the politeness delay · fixed
+
+`_crawl_html` has honoured `opts.delay` and `HOST_CONCURRENCY` since the
+beginning. `_acquire_manifest_links` honoured neither, so the 211-page Mojo
+harvest went out as 211 back-to-back requests to one host.
+
+Nothing failed, which is why it survived: the site tolerated it. That is not the
+same as it being acceptable, and a manifest is a crawl in everything but name.
+
+**Fixed** by giving the loop its own `_Pace(opts.delay)`. Acquisition there is
+sequential, so spacing the starts is the whole of the politeness — there is
+never more than one request open — and at the default 0.4s the two paths now
+cost a host the same. Costs the suite about 12s, all of it in tests that harvest
+a manifest with the default delay rather than an explicit zero.
+
+Worth noting as a class: **the ladder's rungs were built at different times and
+did not inherit each other's manners.** Anything the crawl learned about being a
+good citizen is worth re-checking on rungs 1–5.
 
 ---
 

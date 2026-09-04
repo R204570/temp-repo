@@ -213,6 +213,13 @@ nothing uploaded — so **New chat** no longer throws work away.
 Every tool call the model makes is listed above the answer it produced — what
 was fetched, what kind of source it was, and how much came back — so an answer
 built from a page that was actually read does not look like one that was not.
+**Click any of those rows** to open its execution trace: the exact input the
+tool was given, the stages it went through, and what each returned, nested and
+arriving live rather than assembled at the end. A three-minute harvest is
+watchable for three minutes, a failure is attached to the operation that caused
+it, and where a page had to be clipped the row says how much it left out. There
+are no invented percentages — a progress figure appears only where there is a
+real denominator to divide by, such as a manifest's own page count.
 Each answer carries **Copy / Download .md / Edit**, because the Markdown is
 something you keep, not just something you read. The send button becomes a stop
 button while an answer streams, and stopping keeps what already arrived.
@@ -346,6 +353,11 @@ full-text search over that version only, and marks what matched.
 
 Every view is addressable, so a link goes exactly where you meant:
 `/library#/effect/v3/41`.
+
+**Right-click a technology** to open or to delete it outright — every version of
+it, in one action. Removing a language's documentation one version at a time is
+not a route once it has eight of them. The delete arms before it fires: it asks
+once, and needs a second click.
 
 The menu bar's right-hand corner names the backend that answered. That is not
 decoration: a Postgres box ranks search and a file box cannot, and reading
@@ -687,6 +699,12 @@ whose pitch is calibrated confidence cannot be selective about its own.
   third-party site, and `github actions` reaches a parked page at
   githubactions.com. Check the URL in the result before trusting a harvest, pass
   `ecosystem=` when you know it, and use `forget_resolution` when it is wrong.
+  Two routes to a confidently wrong answer have since been closed: a domain
+  probe no longer keeps its ownership claim when it redirects onto a code host
+  (`mojo.dev` lands on a Java library's repository), and a language can now claim
+  the `lang` domain it publishes from, so `zig` reaches `ziglang.org` and `nim`
+  reaches `nim-lang.org` instead of same-named npm packages. The four cases named
+  above have not been re-measured since.
   See `Project Development/FINDINGS-B.md` and `Project Development/FINDINGS-C.md`.
 - **A page under an unrecognised template is refused, not stored.** Extraction
   tries nine selectors and then scores the page by text-to-link density; where
@@ -715,6 +733,13 @@ the measurements behind each threshold. `PROPOSAL-II.md` (federation, intent,
 passages) and `PROPOSAL-3.md` (streaming storage, measured shape, concurrency,
 bounded reasoning) are both implemented; `ISSUES.md` is the live list of what is
 still open, including every limit above.
+
+Start with **`ARCHITECTURE.md`** — how the pieces fit, in diagrams, including
+the two pathways a harvest can take and what the identity gate will and will not
+believe. **`PRODUCT.md`** is what this is for and who for; **`DESIGN.md`** is the
+interface, recorded from the built pages rather than from intention;
+**`llmsfinder.md`** is the acquisition ladder, with a §10 recording what the
+build learned that the proposal did not anticipate.
 
 ## Security
 
