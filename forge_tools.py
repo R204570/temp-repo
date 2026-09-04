@@ -177,7 +177,7 @@ HARVEST_PAGE_CAP = 0  # 0 = no limit
 
 
 def _options(crawl=False, max_pages=25, js=False, force=None, delay=0.4,
-             cap: int = FETCH_PAGE_CAP) -> Options:
+             cap: int = FETCH_PAGE_CAP, version: str | None = None) -> Options:
     requested = max(0, int(max_pages))
     if cap:
         pages = min(requested, cap) if requested else cap
@@ -189,6 +189,10 @@ def _options(crawl=False, max_pages=25, js=False, force=None, delay=0.4,
         js=bool(js),
         delay=float(delay),
         force=force or None,
+        # Which release was asked for has to reach discovery, not just the
+        # label: it decides whether a site's published `llms.txt` — always
+        # its *current* documentation — can answer the question at all.
+        version=(version or "").strip(),
         verbose=False,
     )
 
@@ -380,7 +384,7 @@ def _harvest_corpus(technology: str, corpus, max_pages: int, js: bool) -> str:
     import passages as psg
 
     opts = _options(crawl=True, max_pages=max_pages, js=js, delay=0.2,
-                    cap=HARVEST_PAGE_CAP)
+                    cap=HARVEST_PAGE_CAP, version=corpus.version)
     stats: dict = {}
     strategy = corpus.shape
 
@@ -684,6 +688,15 @@ class _CountingFetcher(Fetcher):
     not disturb. Counting successful page fetches costs one line and is
     accurate for the same reason: a page is fetched exactly once.
 
+    Two ways a page arrives, so two entry points. A crawl and a sitemap
+    fetch pages as HTML, which `html()` sees. A Markdown-twin manifest
+    fetches them as text -- and `text()` cannot simply be counted too,
+    because it also fetches the manifest itself, robots.txt and sitemaps,
+    which are not pages. So that path calls `page_fetched()` explicitly,
+    from the one place that knows a documentation page was just obtained.
+    Missing this is why an `adk.dev`-shaped harvest -- 229 links, every one
+    of them `.md` -- reported "starting" for its entire run.
+
     `stage`, when given, is the same counter re-expressed as a live trace
     tick for the Web UI — throttled independently of `progress`, which stays
     exact for `list_knowledge_base` because nothing here changes how often
@@ -698,29 +711,34 @@ class _CountingFetcher(Fetcher):
         self._stage = stage
         self._last_tick = 0.0
 
-    def html(self, url: str) -> str:
-        out = super().html(url)
+    def page_fetched(self) -> None:
+        """One documentation page obtained by a route `html()` never sees."""
         self._progress.pages += 1
         if self._progress.expected is None:
             # harvest() records the site's own count before it starts fetching
             # pages, so by the first page this is usually already true.
             self._progress.expected = self._stats.get("discovered")
-        if self._stage is not None:
-            now = time.time()
-            due = (self._progress.pages % TICK_EVERY_PAGES == 0
-                  or now - self._last_tick >= TICK_EVERY_SECONDS)
-            if due:
-                self._last_tick = now
-                expected = self._progress.expected
-                message = (f"fetched {self._progress.pages}/{expected} pages"
-                          if expected else f"fetched {self._progress.pages} pages")
-                counters = {"pages": self._progress.pages}
-                if expected:
-                    counters["expected"] = expected
-                try:
-                    self._stage.tick(message, counters=counters)
-                except Exception:
-                    pass  # a trace hiccup must never interrupt a harvest
+        if self._stage is None:
+            return
+        now = time.time()
+        due = (self._progress.pages % TICK_EVERY_PAGES == 0
+              or now - self._last_tick >= TICK_EVERY_SECONDS)
+        if due:
+            self._last_tick = now
+            expected = self._progress.expected
+            message = (f"fetched {self._progress.pages}/{expected} pages"
+                      if expected else f"fetched {self._progress.pages} pages")
+            counters = {"pages": self._progress.pages}
+            if expected:
+                counters["expected"] = expected
+            try:
+                self._stage.tick(message, counters=counters)
+            except Exception:
+                pass  # a trace hiccup must never interrupt a harvest
+
+    def html(self, url: str) -> str:
+        out = super().html(url)
+        self.page_fetched()
         return out
 
 
@@ -739,7 +757,7 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
     """
     trace = trace or tracing.NULL_CONTEXT
     opts = _options(crawl=True, max_pages=max_pages, js=js, delay=0.2,
-                    cap=HARVEST_PAGE_CAP)
+                    cap=HARVEST_PAGE_CAP, version=version)
     opts.scope = scope or "section"
 
     started = time.time()
@@ -1764,6 +1782,17 @@ def last_trace_id() -> str | None:
     return getattr(_last_trace, "value", None)
 
 
+def reset_trace_id() -> None:
+    """Forget the id from the previous call on this thread.
+
+    Server threads are reused. Without this, a turn whose provider runs its
+    tools out of process (the Claude Code CLI calls them over MCP) would
+    find the id left behind by an earlier, unrelated turn that did run one
+    in process -- and attach a browser to somebody else's execution trace.
+    """
+    _last_trace.value = None
+
+
 def openai_tools() -> list[dict]:
     """Tool schemas in the OpenAI/Groq `tools=[...]` format."""
     return [
@@ -1785,7 +1814,7 @@ def openai_tools() -> list[dict]:
 _TARGET_KEYS = ("url", "name", "query", "technology", "section", "path", "out_dir")
 
 
-def _target_of(arguments: dict) -> str:
+def target_of(arguments: dict) -> str:
     for key in _TARGET_KEYS:
         value = (arguments or {}).get(key)
         if isinstance(value, str) and value.strip():
@@ -1816,7 +1845,7 @@ def run_tool(name: str, arguments: dict[str, Any]) -> str:
 
     allowed = set((tool.schema.get("properties") or {}).keys())
     kwargs = {k: v for k, v in (arguments or {}).items() if k in allowed}
-    call = ctx.stage(name, target=_target_of(kwargs), metadata=dict(kwargs))
+    call = ctx.stage(name, target=target_of(kwargs), metadata=dict(kwargs))
     inner = call.start(f"called {name}")
 
     try:

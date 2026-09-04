@@ -90,6 +90,44 @@ def ordered(labels, newest_first: bool = True) -> list[str]:
     return sorted(labels, key=sort_key, reverse=newest_first)
 
 
+def release_parts(label: str) -> tuple[int, ...]:
+    """The dotted-numeric run of a release label, or `()` if it is not one.
+
+    `"v1.10.4"` and `"1.10.4"` both give `(1, 10, 4)`; `"latest"` gives `()`.
+    """
+    text = (label or "").strip()
+    match = _RELEASE.match(text)
+    if not match or not re.search(r"\d", text):
+        return ()
+    return tuple(int(p) for p in match.group(1).split("."))
+
+
+def same_release(asked: str, found: str) -> bool:
+    """Does `found` answer a request for `asked`?
+
+    Compared component by component, and *directionally*: what was found
+    must be at least as specific as what was asked for. Asking for "2" is
+    answered by "2.11", because the caller named as much of the release as
+    they knew and 2.11 is inside it. Asking for "2.5" is **not** answered by
+    "2" — a page filed under the 2.x line establishes nothing about 2.5, and
+    treating it as an answer is how a request for Mojo 2.5 once matched a
+    stray link to `/2`.
+
+    So: `asked` must be a prefix of `found`. "1.10" is answered by "1.10.4"
+    and by "1.10"; never by "1", "1.9" or "2.11". Handing back another
+    release's documentation under the name of the one asked for is the
+    failure this exists to prevent, and a comparison that is loose in
+    either direction is a way to commit it.
+
+    Anything unorderable — "latest", "stable" — answers nothing, because it
+    makes no claim that can be checked.
+    """
+    a, b = release_parts(asked), release_parts(found)
+    if not a or not b:
+        return False
+    return b[:len(a)] == a
+
+
 def why(label: str) -> str:
     """How this label was ranked — for the honesty contract.
 

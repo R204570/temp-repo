@@ -42,8 +42,10 @@ from contextlib import contextmanager
 
 import llmsfinder
 import reasoning
+import versions
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from typing import NamedTuple
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
@@ -99,6 +101,13 @@ class Options:
     #: Crawl boundary: "section" keeps to the docs root the start URL sits in,
     #: "host" is the whole domain, anything else is used as a literal prefix.
     scope: str = "section"
+    #: Which release the caller asked for, when they named one. This decides
+    #: which of the two acquisition pathways a harvest takes, so it has to
+    #: reach discovery rather than only the label at the end: a site
+    #: publishes `llms.txt` for its *current* release, and answering "give me
+    #: 1.10" with it stores the wrong documentation under the right name.
+    #: Empty means "whatever is current", which is what that file is for.
+    version: str = ""
     # Fetching a user-supplied URL server-side is an SSRF vector, so private /
     # loopback targets are refused unless explicitly allowed.
     allow_private: bool = field(
@@ -266,10 +275,13 @@ class Fetcher:
             raise ForgeError(f"URL has no host: {url!r}")
         if self.opts.allow_private:
             return
-        if _resolves_private(parsed.hostname or ""):
+        host = parsed.hostname or ""
+        if _resolves_private(host):
+            where = _private_address_of(host)
             raise ForgeError(
-                f"Refusing to fetch private/loopback address: {parsed.hostname}. "
-                f"Set DOCSFORGE_ALLOW_PRIVATE=1 to permit it."
+                f"Refusing to fetch private/loopback address: {host}"
+                + (f" resolves to {where}" if where else "")
+                + ". Set DOCSFORGE_ALLOW_PRIVATE=1 to permit it."
             )
 
     # -- primitives --------------------------------------------
@@ -345,6 +357,35 @@ def _decode(r: requests.Response) -> str:
     return r.text
 
 
+#: RFC 6052's well-known prefix for embedding an IPv4 address inside an
+#: IPv6 one. A DNS64 resolver hands these out on NAT64 networks — common on
+#: mobile carriers, IPv6-only CI runners, and plenty of home connections —
+#: and Python reports them as `is_reserved`, because the *prefix* is
+#: reserved. The address they carry is whatever IPv4 is in the low 32 bits,
+#: which is usually an ordinary public host.
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _unwrap_nat64(ip):
+    """The IPv4 address a NAT64 address carries, or the address itself.
+
+    Judging the wrapper instead of its contents is how `github.com` came to
+    be refused as a "private/loopback address" on a NAT64 network: it
+    resolves to 64:ff9b::14cf:4952, which carries the entirely public
+    20.207.73.82. Unwrapping loses no protection — a NAT64 address carrying
+    10.0.0.1 still unwraps to 10.0.0.1 and is still refused.
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64_WELL_KNOWN:
+        return ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
+def _is_private_address(ip) -> bool:
+    ip = _unwrap_nat64(ip)
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
 def _resolves_private(host: str) -> bool:
     if not host:
         return False
@@ -357,10 +398,31 @@ def _resolves_private(host: str) -> bool:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        if _is_private_address(ip):
             return True
     return False
+
+
+def _private_address_of(host: str) -> str:
+    """The address that made `_resolves_private` say yes, for the message.
+
+    Naming only the host left the refusal undiagnosable: a NAT64 network
+    refusing `github.com` reads as a bug in DocsForge, in the sandbox, or
+    in the site, and the one fact that distinguishes them — what the name
+    actually resolved to — was the one thing not reported.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return ""
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_private_address(ip):
+            return str(ip)
+    return ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -904,6 +966,30 @@ def _categorize_failure(exc: Exception) -> str:
     return "invalid_response"
 
 
+def _publish_denominator(stats: dict | None, fetcher: Fetcher, discovered: int,
+                         expected: int, already_in_hand: int) -> None:
+    """Say how many pages are promised *before* fetching them, not after.
+
+    A published manifest is the one strategy that knows its exact
+    denominator up front — that is the whole reason its coverage claim is
+    stronger than a sitemap's. Writing it only once the fetching finished
+    threw that away for the entire time it would have been useful: a
+    229-page harvest showed "fetched 40 pages" for ten minutes when it
+    could have said "40/229".
+
+    `already_in_hand` is documents obtained before the loop starts — a
+    hybrid's root prose, which arrived with the manifest itself — counted
+    now so the progress figure and the denominator describe the same set.
+    """
+    if stats is not None:
+        stats.setdefault("expected", expected)
+        stats["discovered"] = discovered
+    note_page = getattr(fetcher, "page_fetched", None)
+    if callable(note_page):
+        for _ in range(already_in_hand):
+            note_page()
+
+
 def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
                             opts: Options) -> tuple[list[Doc], list[dict]]:
     """Fetch every manifest link, keeping successes and failures apart.
@@ -918,11 +1004,34 @@ def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
     """
     docs: list[Doc] = []
     failed: list[dict] = []
+    #: Optional, duck-typed like `sink`: a fetcher that wants to report
+    #: progress says so by having this. A Markdown twin is fetched with
+    #: `text()`, which no progress counter can hook the way it hooks
+    #: `html()` -- `text()` also fetches manifests, robots.txt and sitemaps,
+    #: and counting those as pages would inflate the very number the
+    #: coverage claim rests on. So the acquisition loop, which is the one
+    #: place that knows a *documentation page* was just obtained, says so.
+    note_page = getattr(fetcher, "page_fetched", None)
+
+    #: A manifest is a list of pages on one host, so acquiring it is a crawl
+    #: in everything but name -- 211 requests, for mojolang.org. `_crawl_html`
+    #: has spaced its requests to a host since the beginning; this path
+    #: ignored `opts.delay` outright and fired the lot back to back, which is
+    #: how a small documentation host learns to refuse us. Sequential here, so
+    #: spacing the starts is the whole of the politeness: there is never more
+    #: than one request open.
+    pace = _Pace(opts.delay)
+
     for title, link_url in links:
+        pace.wait(link_url)
         try:
             if llmsfinder.is_markdown_link(link_url):
                 text = fetcher.text(link_url, timeout=MAP_TIMEOUT)
                 docs.append(Doc(link_url, title, _meta_header(link_url, "llms_txt") + text))
+                if callable(note_page):
+                    # Only here: the branch below goes through `html()`,
+                    # which such a fetcher already counts for itself.
+                    note_page()
             else:
                 doc_title, md = _extract_page(link_url, fetcher, opts)
                 docs.append(Doc(link_url, doc_title or title, _meta_header(link_url, "html") + md))
@@ -937,14 +1046,16 @@ def _acquire_manifest_links(links: list[tuple[str, str]], fetcher: Fetcher,
 
 def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                     stats: dict | None = None,
-                    restrict_links: list[tuple[str, str]] | None = None) -> list[Doc]:
+                    restrict_links: list[tuple[str, str]] | None = None,
+                    drop_root: bool = False) -> list[Doc]:
     """Acquire documentation from a detected llms.txt / llms-full.txt source.
 
-    `restrict_links` is set by `harvest()` when the caller asked for one
-    version of the docs and the manifest could be safely filtered to it
-    (see `_llms_txt_version_scope`). When present it replaces whatever
-    `parse_llms_links()` would find in the body, so acquisition only ever
-    touches pages already proven to belong to that version.
+    `restrict_links` is set by `harvest()` when the published file is not
+    what the caller asked for but part of it is — one release out of
+    several, or one section of a site (see `_scope_site_wide_llms`). When
+    present it replaces whatever `parse_llms_links()` would find in the
+    body, so acquisition only ever touches pages already shown to belong to
+    what was asked for.
     """
     body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
     body = body.strip()
@@ -967,38 +1078,83 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
         if excluded:
             _log(opts, f"  excluded {excluded} off-site manifest link(s) from the expected count")
 
+        # `max_pages` means "deliberately cut this harvest short", and the
+        # manifest path used to be the one strategy that ignored it: asking
+        # for ten pages of a 229-page manifest fetched all 229, and reported
+        # nothing about having done so. `promised` stays the site's own
+        # count so the coverage figure is still measured against what
+        # exists, while `truncated` is what makes the shortfall speak.
+        promised = len(links)
+        cap = opts.limit()
+        over = 0 if cap is None else max(0, promised - cap)
+        if over:
+            links = links[:cap]
+            _log(opts, f"  stopping at the {cap}-page limit: the manifest lists "
+                       f"{promised}, so {over} are left unfetched")
+        if stats is not None:
+            stats["truncated"] = over > 0
+            stats["remaining"] = over
+
         if shape == "hybrid":
             # A hybrid manifest promises two different things: its own root
             # prose (already in hand as `body`) and whatever pages its links
             # describe. The two are recorded separately so root success can
             # never stand in for corpus completeness.
+            #
+            # Whether the root survives is decided upstream, by *why* the
+            # links were narrowed -- see `Pathway.drop_root`. Narrowing for
+            # a release condemns the prose with the links, because the file
+            # documents a different release. Narrowing for a section does
+            # not: the file already showed it covers that section, and its
+            # overview is the same site's own words about it. Deciding here
+            # from `restrict_links is not None` conflated the two and threw
+            # away 1.1 MB of real documentation on mojolang.org.
+            keep_root = not drop_root
             root_doc = Doc(det.url, "llms.txt Overview", _meta_header(det.url, "llms.txt") + body)
+            if not keep_root:
+                _log(opts, "  dropping the root document: the manifest was narrowed, "
+                           "and its own prose is not what was asked for")
+            # Measured against what the site says exists, not against the
+            # slice a page limit left behind — otherwise cutting a harvest
+            # short would make it *look* complete.
+            expected_count = promised
+            root_count = 1 if keep_root else 0
+            _publish_denominator(stats, fetcher, expected_count + root_count,
+                                 expected_count, root_count)
+
             docs, failed = _acquire_manifest_links(links, fetcher, opts)
-            expected_count = len(links)
             acquired_count = len(docs)
             failed_count = len(failed)
             is_whole = acquired_count == expected_count
 
             if stats is not None:
                 stats["expected"] = expected_count
-                stats["discovered"] = expected_count + 1
+                stats["discovered"] = expected_count + root_count
                 stats["acquired"] = acquired_count
-                stats["fetched"] = acquired_count + 1
+                stats["fetched"] = acquired_count + root_count
                 stats["failed"] = failed_count
                 stats["failed_urls"] = failed
                 stats["whole"] = is_whole
-                if not is_whole:
+                if not is_whole and not over:
+                    # A truncated harvest is already explained by the page
+                    # limit; calling those pages "could not be acquired"
+                    # would blame the site for the caller's own bound.
                     stats["reason"] = (
-                        f"hybrid root document stored, but {failed_count} of {expected_count} "
+                        f"{'hybrid root document stored, but ' if keep_root else ''}"
+                        f"{failed_count} of {expected_count} "
                         f"manifest linked pages could not be acquired"
                     )
 
-            return [root_doc] + docs
+            return ([root_doc] + docs) if keep_root else docs
 
         # shape == "index"
         if links:
+            # As above: the denominator is the site's own count, so a page
+            # limit shows up as a shortfall rather than as completeness.
+            expected_count = promised
+            _publish_denominator(stats, fetcher, expected_count, expected_count, 0)
+
             docs, failed = _acquire_manifest_links(links, fetcher, opts)
-            expected_count = len(links)
             acquired_count = len(docs)
             failed_count = len(failed)
             is_whole = (acquired_count == expected_count and expected_count > 0)
@@ -1011,7 +1167,7 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
                 stats["failed"] = failed_count
                 stats["failed_urls"] = failed
                 stats["whole"] = is_whole
-                if not is_whole:
+                if not is_whole and not over:
                     stats["reason"] = (
                         f"manifest declared {expected_count} unique pages, but {failed_count} "
                         f"could not be acquired"
@@ -1043,42 +1199,181 @@ def handle_llms_txt(det: Detection, fetcher: Fetcher, opts: Options,
     return [Doc(det.url, "llms.txt", _meta_header(det.url, "llms.txt") + body)]
 
 
-def _llms_txt_version_scope(url: str, det: "Detection", fetcher: Fetcher
-                            ) -> list[tuple[str, str]] | None:
-    """Manifest links safely identifiable as belonging to the version `url`
-    names, or None when the manifest cannot be scoped that way.
-
-    Reuses `docs_scope()` — the same version-anchored prefix the crawl path
-    already stays inside — instead of inventing a second way to detect a
-    version. A link only survives if its own path starts with that exact
-    prefix, so this can narrow a site-wide manifest down to one version but
-    can never admit another version into it: the worst it can do wrong is
-    return too little, never too much.
-
-    None means there is nothing reliable to filter by: the request's own
-    prefix does not end on a version segment, the manifest is a dump with no
-    per-page URLs to check it against, or filtering leaves nothing. Either
-    way the caller should fall back to the version-scoped crawler instead of
-    trusting a manifest that cannot prove it is scoped.
-    """
-    prefix = docs_scope(url)
-    prefix_parts = [p for p in prefix.split("/") if p]
-    if not prefix_parts or not _VERSION.match(prefix_parts[-1]):
-        return None
-
-    body = det.body if det.body is not None else fetcher.text(det.url, timeout=DUMP_TIMEOUT)
-    body = body.strip()
-    if llmsfinder.classify_llms_shape(body) not in ("index", "hybrid"):
-        return None
-
-    links = llmsfinder.parse_llms_links(body, det.url)
-    scoped = []
+def _links_under(links: list[tuple[str, str]], prefix: str) -> list[tuple[str, str]]:
+    """Those links whose own path sits under `prefix`."""
+    out = []
     for title, link in links:
         path = urlparse(link).path
         path = path if path.endswith("/") else path + "/"
         if path.startswith(prefix):
-            scoped.append((title, link))
-    return scoped or None
+            out.append((title, link))
+    return out
+
+
+def _links_for_release(links: list[tuple[str, str]], asked: str) -> list[tuple[str, str]]:
+    """Those links whose own path names the release asked for.
+
+    For sites that file every release side by side — `/docs/1.10/…` beside
+    `/docs/2.11/…` — the manifest lists them all and the path is what says
+    which is which. Compared through `versions.same_release`, so asking for
+    "1.10" also matches "1.10.4" and never matches "1.9".
+    """
+    out = []
+    for title, link in links:
+        for part in (p for p in urlparse(link).path.split("/") if p):
+            if _VERSION.match(part) and versions.same_release(asked, part):
+                out.append((title, link))
+                break
+    return out
+
+
+
+def _requested_release(url: str, opts: Options) -> str:
+    """The release the caller asked for, or `""` for "whatever is current".
+
+    Read from the `version` they passed first, and from the URL they pointed
+    at second — `/docs/v3/` names a release just as plainly as `version="v3"`
+    does, and a caller who gave both meant the one they typed.
+    """
+    asked = (getattr(opts, "version", "") or "").strip()
+    if asked:
+        return asked
+    for part in (p for p in urlparse(url).path.split("/") if p):
+        if _VERSION.match(part):
+            return part
+    return ""
+
+
+class Pathway(NamedTuple):
+    """How a published file may be used for one request.
+
+        skip           do not use it at all; fall down the ladder to a crawl
+        restrict_links use it, but only these entries (None = as published)
+        drop_root      discard its own prose along with the links it lost
+
+    `drop_root` is separate from `restrict_links` because narrowing happens
+    for two different reasons and only one of them condemns the prose. A
+    release request narrows because the file documents a *different*
+    release, so its text is the wrong release's text. A section request
+    narrows a file that has already shown it covers the section, and its
+    text is then the same site's overview of it.
+    """
+
+    skip: bool
+    restrict_links: list[tuple[str, str]] | None
+    drop_root: bool
+
+
+def _scope_site_wide_llms(url: str, det: "Detection", fetcher: Fetcher,
+                          opts: Options) -> Pathway:
+    """Which of the two acquisition pathways this request takes.
+
+    `llms.txt` and `llms-full.txt` are the reason to prefer publication over
+    crawling: a site that publishes them has already produced its *current*
+    documentation, complete and LLM-ready, and reading it costs one request
+    against a crawl's hundreds. Which is exactly why the two cases divide:
+
+    **No release named** — that published file is precisely what was asked
+    for. Take it. This is the pathway worth having, and it stays cheap.
+
+    **A release named** — the published file is the current one, and current
+    is not what was asked for. It answers only if it can *show* it is that
+    release: by stating so in its header, or by listing pages filed under
+    it. Otherwise the version-scoped crawl is the honest answer, because
+    storing one release's documentation under another's name is the failure
+    the whole version contract exists to prevent.
+
+    Sitting across both: never broaden a scoped request. `docs.modular.com`
+    publishes one `llms.txt` for Modular Cloud, so a request for `/mojo/`
+    came back as API-key and billing documentation — no release involved,
+    just a file about a different product on the same host.
+    """
+    if not _at_the_site_root(det):
+        return Pathway(False, None, False)   # already scoped below the root
+
+    asked = _requested_release(url, opts)
+
+    if det.kind != "llms_txt":
+        # Another strategy's artifact is all-or-nothing, and a site-wide one
+        # cannot answer for a release nothing has checked.
+        return Pathway(bool(asked), None, False)
+
+    # Nothing below can change the answer when no release was named and the
+    # caller's URL already covers the whole site: `_pathway_for_latest` takes
+    # the file as published, whatever its links turn out to say. Reading the
+    # body to discover that costs a second fetch of a file already in hand,
+    # which is precisely the redundant discovery the ladder forbids.
+    if not asked and docs_scope(url) == "/":
+        return Pathway(False, None, False)
+
+    try:
+        body = det.body if det.body is not None else fetcher.text(det.url,
+                                                                  timeout=DUMP_TIMEOUT)
+    except ForgeError:
+        return Pathway(bool(asked), None, False)
+    body = body.strip()
+    links = (llmsfinder.parse_llms_links(body, det.url)
+             if llmsfinder.classify_llms_shape(body) in ("index", "hybrid") else None)
+
+    if asked:
+        return _pathway_for_release(asked, body, links, det, opts)
+    return _pathway_for_latest(url, links, det, opts)
+
+
+def _pathway_for_release(asked: str, body: str, links: list[tuple[str, str]] | None,
+                         det: "Detection", opts: Options) -> "Pathway":
+    """A specific release was named, so the published file has to earn it."""
+    name = det.url.rsplit("/", 1)[-1]
+
+    declared = llmsfinder.declared_version(body)
+    if declared and versions.same_release(asked, declared):
+        _log(opts, f"  {name} states version {declared} — that is the {asked} "
+                   f"documentation, taking it whole")
+        return Pathway(False, None, False)
+
+    if links:
+        scoped = _links_for_release(links, asked)
+        if scoped:
+            _log(opts, f"  narrowing {name} to the {len(scoped)} page(s) it files "
+                       f"under version {asked}")
+            # The root prose is the file's own text, and the file is
+            # published for the CURRENT release. Only its per-release links
+            # survived the check, so keeping the prose would put the wrong
+            # release's documentation in beside the right one's pages.
+            return Pathway(False, scoped, True)
+
+    _log(opts, f"  ignoring {name}: it is published for the current release and "
+               f"cannot show it documents {asked} — crawling that version instead")
+    return Pathway(True, None, False)
+
+
+def _pathway_for_latest(url: str, links: list[tuple[str, str]] | None,
+                        det: "Detection", opts: Options) -> "Pathway":
+    """No release named: the current documentation is the thing wanted, and
+    the published file is it — subject only to actually covering the section
+    that was asked for."""
+    prefix = docs_scope(url)
+    if prefix == "/":
+        return Pathway(False, None, False)   # the whole site, in one request
+    if links is None:
+        # A dump lists no pages, so it makes no checkable claim about what it
+        # covers. Refusing on a suspicion nothing supports would trade a
+        # site's whole published corpus for a crawl.
+        return Pathway(False, None, False)
+
+    scoped = _links_under(links, prefix)
+    if scoped:
+        # Narrowed, but the root prose stays. Reaching here means the file
+        # has already shown it covers this section -- a file covering none of
+        # it is refused below and never narrowed at all. Its overview is then
+        # this site's own words about a site that includes the section, and
+        # dropping it cost 1.1 MB of real documentation on mojolang.org,
+        # whose root is literally "Mojo programming language documentation".
+        return Pathway(False, scoped, False)
+
+    _log(opts, f"  the site-wide {det.url.rsplit('/', 1)[-1]} lists {len(links)} "
+               f"page(s) and none under {prefix} — it documents something else")
+    return Pathway(True, None, False)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1648,15 +1943,23 @@ def docs_scope(url: str) -> str:
     return "/" + "/".join(folder) + "/" if folder else "/"
 
 
-def _asks_for_a_version(url: str) -> bool:
-    """Does this URL name a particular version of the documentation?"""
-    return any(_VERSION.match(p) for p in urlparse(url).path.split("/") if p)
+def _at_the_site_root(det: Detection) -> bool:
+    """True when the detected file sits at the origin root.
 
+    A file there describes the whole site, so it cannot be assumed to answer
+    a request for one release or one section of it. What matters is where the
+    file sits, not how we came by its URL: this used to also require that we
+    had *probed* for it, on the reasoning that a URL the caller typed is a URL
+    the caller meant. But the caller does not type it any more — resolution
+    hands `learn_technology` whatever it found, and it now finds
+    `mojolang.org/llms.txt` directly. Asking for Mojo 0.9 then went straight
+    past the release check and took the current manifest whole.
 
-def _probed_at_the_root(url: str, det: Detection) -> bool:
-    """True when a detection came from probing the origin rather than from the
-    URL the caller actually gave us."""
-    return det.url != url and urlparse(det.url).path.count("/") == 1
+    A file below the root is still left alone: `/en/4.2/llms.txt` is already
+    scoped to what was asked for, and putting it through the release check
+    would narrow, or refuse, a file that is the right one.
+    """
+    return urlparse(det.url).path.count("/") == 1
 
 
 def _normalize(url: str) -> str:
@@ -2400,30 +2703,22 @@ def harvest(url: str, opts: Options | None = None, fetcher: Fetcher | None = Non
             # version. If the manifest itself can prove which of its entries
             # belong to that version, use just those; otherwise crawl the
             # version they named instead.
-            restrict_links = None
-            skip_llms = False
-            if _asks_for_a_version(url) and _probed_at_the_root(url, det):
-                skip_llms = True
-                if det.kind == "llms_txt":
-                    try:
-                        restrict_links = _llms_txt_version_scope(url, det, fetcher)
-                    except ForgeError:
-                        restrict_links = None
-                    if restrict_links is not None:
-                        skip_llms = False
+            pathway = _scope_site_wide_llms(url, det, fetcher, opts)
+            restrict_links = pathway.restrict_links
 
-            if skip_llms:
-                _log(opts, "  ignoring the site-wide llms.txt: "
-                           "the URL asks for one version of the docs")
+            if pathway.skip:
+                _log(opts, "  ignoring the site-wide llms.txt: it does not cover "
+                           "the section this URL asks for")
             else:
                 if restrict_links is not None:
-                    _log(opts, f"  scoping the site-wide llms.txt to the requested "
-                               f"version ({len(restrict_links)} manifest page(s))")
+                    _log(opts, f"  scoping the site-wide llms.txt to {docs_scope(url)} "
+                               f"({len(restrict_links)} manifest page(s))")
                 _log(opts, f"  harvesting via {det.kind}")
                 try:
                     if det.kind == "llms_txt":
                         docs = handle_llms_txt(det, fetcher, opts, stats=stats,
-                                               restrict_links=restrict_links)
+                                               restrict_links=restrict_links,
+                                               drop_root=pathway.drop_root)
                     else:
                         docs = HANDLERS[det.kind](det, fetcher, opts)
                 except ForgeError as e:

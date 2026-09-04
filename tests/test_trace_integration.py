@@ -328,3 +328,143 @@ def test_a_harvest_past_the_deadline_keeps_tracing_after_run_tool_returns(monkey
     assert trace.finished is not None, "the background thread should close its own trace"
     resolving = by_name(trace, "resolving identity")
     assert resolving.state == tr.COMPLETED
+
+
+# ── progress on the pathway that fetches pages as text ──────────────
+# `_CountingFetcher` hooks `html()`, which a crawl and a sitemap use. A
+# Markdown-twin manifest fetches its pages with `text()` instead, so the
+# design doc's own headline case -- adk.dev, 229 links, every one `.md` --
+# counted zero pages and reported "starting" for its entire run.
+def _serve(pages, monkeypatch):
+    import docsforge as df
+
+    class Resp:
+        def __init__(self, text, status=200):
+            self.text, self.status_code = text, status
+            self.headers = {"content-type": "text/plain"}
+
+        @property
+        def content(self):
+            return self.text.encode("utf-8")
+
+    def fake_get(self, url, **kw):
+        body = pages.get(url.rstrip("/"), pages.get(url))
+        return Resp(body) if body is not None else Resp("not found", 404)
+
+    monkeypatch.setattr(df.Fetcher, "get", fake_get)
+
+
+def test_a_markdown_twin_manifest_counts_the_pages_it_fetches(monkeypatch):
+    import docsforge as df
+
+    pages = {"https://x.dev/llms.txt":
+             "# Index\n\n" + "\n".join(f"- [P{i}](https://x.dev/p{i}.md)"
+                                       for i in range(6))}
+    for i in range(6):
+        pages[f"https://x.dev/p{i}.md"] = f"# P{i}\n\nbody"
+    _serve(pages, monkeypatch)
+
+    progress = harvest_jobs.Progress()
+    stats = {}
+    ctx = tr.start("x")
+    stage = ctx.stage("harvesting")
+    stage.start()
+
+    opts = df.Options(verbose=False, delay=0.0)
+    with ft._CountingFetcher(opts, progress, stats, stage=stage) as fetcher:
+        docs, strategy = df.harvest("https://x.dev/llms.txt", opts,
+                                    fetcher=fetcher, stats=stats)
+
+    assert strategy == "llms.txt (md manifest)"
+    assert len(docs) == 6
+    assert progress.pages == 6, "every page fetched is a page counted"
+    assert progress.expected == 6
+
+    ticked = [e for e in tr.get(ctx.trace_id).events() if e.counters.get("pages")]
+    assert ticked, "the live trace must see the progress too"
+
+
+def test_infrastructure_fetches_are_not_counted_as_pages(monkeypatch):
+    """`text()` also fetches the manifest itself, robots.txt and sitemaps.
+    Counting those would inflate the number the coverage claim rests on,
+    which is why the acquisition loop reports pages rather than the
+    transport guessing."""
+    import docsforge as df
+
+    pages = {"https://x.dev/llms.txt":
+             "# Index\n\n" + "\n".join(f"- [P{i}](https://x.dev/p{i}.md)"
+                                       for i in range(3))}
+    for i in range(3):
+        pages[f"https://x.dev/p{i}.md"] = f"# P{i}\n\nbody"
+    _serve(pages, monkeypatch)
+
+    progress = harvest_jobs.Progress()
+    stats = {}
+    opts = df.Options(verbose=False, delay=0.0)
+    with ft._CountingFetcher(opts, progress, stats) as fetcher:
+        docs, _ = df.harvest("https://x.dev/llms.txt", opts,
+                             fetcher=fetcher, stats=stats)
+
+    assert len(docs) == 3
+    assert progress.pages == 3, "the manifest fetch itself is not a page"
+
+
+def test_the_exact_denominator_is_known_before_the_fetching_starts(monkeypatch):
+    """A published manifest knows how many pages it promises up front —
+    that is why its coverage claim beats a sitemap's. Publishing it only
+    after the loop finished meant a 229-page harvest read "fetched 40
+    pages" for the whole ten minutes it could have read "40/229"."""
+    import docsforge as df
+
+    pages = {"https://x.dev/llms.txt":
+             "# Index\n\n" + "\n".join(f"- [P{i}](https://x.dev/p{i}.md)"
+                                       for i in range(8))}
+    for i in range(8):
+        pages[f"https://x.dev/p{i}.md"] = f"# P{i}\n\nbody"
+    _serve(pages, monkeypatch)
+
+    progress = harvest_jobs.Progress()
+    progress.phase = "harvesting"      # what learn_technology sets before this
+    stats = {}
+    seen: list[str] = []
+
+    opts = df.Options(verbose=False, delay=0.0)
+    with ft._CountingFetcher(opts, progress, stats) as fetcher:
+        real = fetcher.page_fetched
+
+        def spy():
+            real()
+            seen.append(progress.line())
+
+        fetcher.page_fetched = spy
+        df.harvest("https://x.dev/llms.txt", opts, fetcher=fetcher, stats=stats)
+
+    assert seen[0] == "harvesting 1/8 pages", "the total is known from the first page"
+    assert seen[-1] == "harvesting 8/8 pages"
+    assert "so far" not in " ".join(seen), "an exact count never says 'so far'"
+
+
+def test_a_hybrid_root_counts_as_a_page_it_already_holds(monkeypatch):
+    """The root arrives with the manifest rather than through the fetch
+    loop. Counting it keeps the progress figure and the denominator
+    describing the same set of documents."""
+    import docsforge as df
+
+    body = ("# Docs\n\n> summary\n\n" + ("Root prose. " * 80) + "\n\n"
+            + "\n".join(f"- [P{i}](https://x.dev/p{i}.md)" for i in range(4)))
+    pages = {"https://x.dev/llms.txt": body}
+    for i in range(4):
+        pages[f"https://x.dev/p{i}.md"] = f"# P{i}\n\nbody"
+    _serve(pages, monkeypatch)
+
+    progress = harvest_jobs.Progress()
+    stats = {}
+    opts = df.Options(verbose=False, delay=0.0)
+    with ft._CountingFetcher(opts, progress, stats) as fetcher:
+        docs, _ = df.harvest("https://x.dev/llms.txt", opts,
+                             fetcher=fetcher, stats=stats)
+
+    assert len(docs) == 5, "four linked pages plus the root"
+    assert stats["discovered"] == 5
+    assert progress.pages == 5, "the root is a document obtained, so it counts"
+    assert progress.expected == 5

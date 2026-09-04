@@ -151,3 +151,84 @@ def test_chat_stream_logs_the_tool_call_sequence_for_the_turn(monkeypatch, tmp_p
     turns = [l for l in lines if l["kind"] == "turn"]
     assert turns, "expected a 'turn' behaviour-pattern log line"
     assert any("read_knowledge_base" in t for t in turns[-1]["tools"])
+
+
+# ── providers that run tools somewhere this process cannot see ──────
+class _OutOfProcessProvider:
+    """Shaped like providers/claudecode.py, which is the whole point.
+
+    It hands DocsForge's tools to the Claude Code CLI, which calls them
+    over MCP from a process of its own -- so `run_tool` never executes
+    here, and until this was fixed there was no trace at all and the UI
+    row had nothing to open."""
+
+    name = "cli"
+
+    def model(self):
+        return "cli-model"
+
+    def stream(self, *, system, history, tools, run_tool) -> Iterator[dict[str, Any]]:
+        args = {"name": "mojo", "api_key": "sk-live-not-for-the-browser"}
+        yield tool_start("learn_technology", args)
+        # Note: run_tool is deliberately NOT called.
+        yield tool_end("learn_technology", "Harvested **mojo** 1.0.0 — 306 pages.", kind="")
+        yield text("done")
+
+
+def test_a_tool_run_out_of_process_is_still_traceable(monkeypatch):
+    monkeypatch.setattr(app.providers, "get", lambda name: _OutOfProcessProvider())
+
+    body = "".join(app.chat_stream([{"role": "user", "content": "mojo?"}], "cli"))
+    ends = [d for k, d in parse_sse(body) if k == "tool" and d.get("phase") == "end"]
+    assert ends, "expected a tool_end event"
+    trace_id = ends[0]["trace_id"]
+    assert trace_id, "a tool this process never ran must still be traceable"
+
+    events = tr.get(trace_id).events()
+    call = next(e for e in events if e.name == "learn_technology")
+    assert call.state == "completed"
+    assert call.output == "Harvested **mojo** 1.0.0 — 306 pages.", "what came back"
+    assert call.target == "mojo"
+    assert call.metadata["name"] == "mojo", "what was executed"
+    # The sanitisation boundary holds on this path too.
+    assert call.metadata["api_key"] == "[redacted]"
+
+
+def test_an_out_of_process_failure_keeps_the_text_the_model_was_given(monkeypatch):
+    class Failing(_OutOfProcessProvider):
+        def stream(self, *, system, history, tools, run_tool):
+            yield tool_start("learn_technology", {"name": "ghost"})
+            yield tool_end("learn_technology", "Error: could not resolve 'ghost'", kind="")
+            yield text("done")
+
+    monkeypatch.setattr(app.providers, "get", lambda name: Failing())
+    body = "".join(app.chat_stream([{"role": "user", "content": "ghost?"}], "cli"))
+    ends = [d for k, d in parse_sse(body) if k == "tool" and d.get("phase") == "end"]
+
+    call = next(e for e in tr.get(ends[0]["trace_id"]).events()
+                if e.name == "learn_technology")
+    assert call.state == "failed"
+    assert "could not resolve" in call.error
+    assert "could not resolve" in call.output
+
+
+def test_a_stale_thread_local_id_is_never_reused_for_another_turn(monkeypatch):
+    """Server threads are reused. A turn whose tools run out of process must
+    not inherit the trace id an earlier in-process turn left behind."""
+    import forge_tools as ft
+
+    monkeypatch.setattr(app.providers, "get", lambda name: _FakeProvider())
+    first = "".join(app.chat_stream([{"role": "user", "content": "a"}], "fake"))
+    first_id = [d for k, d in parse_sse(first)
+                if k == "tool" and d.get("phase") == "end"][0]["trace_id"]
+    assert ft.last_trace_id() == first_id, "the thread-local is genuinely left set"
+
+    monkeypatch.setattr(app.providers, "get", lambda name: _OutOfProcessProvider())
+    second = "".join(app.chat_stream([{"role": "user", "content": "b"}], "cli"))
+    second_id = [d for k, d in parse_sse(second)
+                 if k == "tool" and d.get("phase") == "end"][0]["trace_id"]
+
+    assert second_id != first_id, "the second turn must not borrow the first's trace"
+    call = next(e for e in tr.get(second_id).events()
+                if e.name == "learn_technology")
+    assert call.target == "mojo"

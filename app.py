@@ -158,11 +158,44 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _trace_a_reported_call(name: str, args: dict, result: str, ok: bool) -> str | None:
+    """Record a tool call this process did not run itself.
+
+    Not every provider executes tools in this process: the Claude Code
+    provider hands DocsForge's tool surface to the CLI, which calls it over
+    MCP from a process of its own, so `run_tool` -- and the trace it builds
+    -- never happen here. The provider still reports what it called and what
+    came back, and that is precisely what the detail view is for.
+
+    What such a trace cannot contain is the internal stages (resolving,
+    harvesting, storing): those really did happen somewhere else. It says
+    what ran and what it returned, and claims nothing further.
+    """
+    try:
+        ctx = tracing.start(name)
+        stage = ctx.stage(name, target=forge_tools.target_of(args),
+                          metadata=dict(args or {}))
+        stage.start(f"called {name}")
+        if ok:
+            stage.finish(tracing.COMPLETED,
+                         message=f"returned {len(result):,} characters",
+                         result={"characters": len(result)}, output=result)
+        else:
+            stage.finish(tracing.FAILED, error=result[:300], output=result)
+        ctx.close()
+        return ctx.trace_id
+    except Exception:
+        return None   # observability must never break the turn it describes
+
+
 def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]:
     """Drive the chosen provider, mapping its events onto SSE."""
     turn_started = time.perf_counter()
     tool_log: list[str] = []          # the "behaviour pattern" this turn traced
     outcome = "error"
+    # Server threads are reused, so an id left by an earlier turn must not be
+    # mistaken for this one's.
+    forge_tools.reset_trace_id()
 
     try:
         provider = providers.get(provider_name)
@@ -173,6 +206,10 @@ def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]
         return
 
     answer: list[str] = []
+    #: Arguments seen at tool_start, kept until the matching tool_end, for
+    #: providers whose tools this process never sees run.
+    pending_args: dict[str, dict] = {}
+    claimed: set[str] = set()
     try:
         for event in provider.stream(
             system=SYSTEM_PROMPT,
@@ -185,14 +222,24 @@ def chat_stream(history: list[dict], provider_name: str | None) -> Iterator[str]
                 answer.append(event["text"])
                 yield _sse("token", {"text": event["text"]})
             elif kind == "tool_start":
+                pending_args[event["name"]] = event.get("args") or {}
                 yield _sse("tool", {"phase": "start", "name": event["name"], "args": event["args"]})
             elif kind == "tool_end":
-                # `run_tool()` just ran, synchronously, on this same thread --
-                # its trace id is still sitting in the thread-local it set,
-                # so the Web UI can open a live/replay view of exactly this
-                # tool call without app.py needing to plumb the id through
-                # the provider's own event shape.
+                # An in-process provider has just returned from `run_tool()`
+                # on this very thread, so the id it recorded is still in the
+                # thread-local and carries the full nested trace. A provider
+                # that ran the tool elsewhere leaves nothing there -- or,
+                # after an earlier in-process call this turn, leaves an id
+                # already spoken for. Either way the fallback records what
+                # the provider itself reported.
                 trace_id = forge_tools.last_trace_id()
+                if not trace_id or trace_id in claimed:
+                    trace_id = _trace_a_reported_call(
+                        event["name"], pending_args.pop(event["name"], {}),
+                        event.get("result") or event.get("preview") or "",
+                        event["ok"])
+                if trace_id:
+                    claimed.add(trace_id)
                 tool_log.append(f"{event['name']}:{'ok' if event['ok'] else 'error'}")
                 yield _sse("tool", {
                     "phase": "end",

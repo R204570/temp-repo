@@ -416,6 +416,17 @@ def probe_docs_root(url: str, fetcher: Fetcher) -> list[Candidate]:
 #: evidence that the project owns the name.
 NAME_TLDS = ("dev", "io", "org", "com")
 
+#: A language whose bare name is a common word publishes on a `lang` domain
+#: for exactly that reason: ziglang.org, nim-lang.org, golang.org,
+#: rust-lang.org, julialang.org, kotlinlang.org, crystal-lang.org,
+#: elixir-lang.org, scala-lang.org, dlang.org, vlang.io, mojolang.org.
+#: `_owns_the_name` accepts these hosts, but nothing ever tried them, so the
+#: highest-signal source we have never saw the site: `zig` resolved to an npm
+#: templating library and `nim` to an unrelated repository -- both *verified*,
+#: each on a registry package that agreed with itself. Nearly all of them sit
+#: on .org, so this costs four probes rather than the full NAME_TLDS spread.
+LANG_TLDS = ("org", "io")
+
 #: A missing domain fails fast at DNS, so this can be tight.
 DOMAIN_TIMEOUT = 6
 
@@ -520,9 +531,14 @@ def _probe_origins(origins: list[tuple[str, str]], slug: str, fetcher: Fetcher,
             found.source = f"domain:{label}/{found.source}"
             found.confidence = min(0.97, found.confidence + 0.02)
             out.append(found)
-        out.append(Candidate(landed, f"domain:{label}", 0.75,
-                             f"{_host(landed)} is the project's own domain and "
-                             f"carries {why}"))
+        # Say truthfully where we ended up. A redirect onto a code host does
+        # not make that host the project's; the repository under it may well
+        # be the right one, but that is a claim about the path, not the name.
+        claim = (f"{_host(landed)} is the project's own domain and carries {why}"
+                 if not is_forge(landed) else
+                 f"{slug}.{label} redirects onto {_host(landed)}, a code host "
+                 f"owned by no one project; the page there carries {why}")
+        out.append(Candidate(landed, f"domain:{label}", 0.75, claim))
     return out
 
 
@@ -539,8 +555,11 @@ def from_domains(name: str, fetcher: Fetcher, state=None) -> list[Candidate]:
     slug = normalise(name)
     if not slug or len(slug) < 2:
         return []
-    return _probe_origins([(tld, f"https://{slug}.{tld}") for tld in NAME_TLDS],
-                          slug, fetcher, state=state)
+    origins = [(tld, f"https://{slug}.{tld}") for tld in NAME_TLDS]
+    if not slug.endswith("lang"):        # `golang` would give golanglang.org
+        origins += [(f"lang.{tld}", f"https://{slug}{sep}lang.{tld}")
+                    for sep in ("", "-") for tld in LANG_TLDS]
+    return _probe_origins(origins, slug, fetcher, state=state)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -671,6 +690,15 @@ def _owns_the_name(url: str, slug: str) -> bool:
     if any(label == slug or label.replace("-", "") == flat for label in labels):
         return True
 
+    # A language whose bare name is a common word takes a `lang` suffix on its
+    # domain for exactly that reason: golang.org, rust-lang.org, julialang.org,
+    # nim-lang.org, crystal-lang.org, mojolang.org. Refusing the suffix denied
+    # every one of them a claim on its own name — Mojo's real docs sat
+    # unverified at 0.92 while an npm package called `mojo` was resolved
+    # instead. The suffix is fixed, so `mojoportal.org` is still refused.
+    if any(label.replace("-", "") == flat + "lang" for label in labels):
+        return True
+
     # A multi-word name may be spread across labels rather than run into one:
     # `apache airflow` lives at airflow.apache.org and `visual studio code` at
     # code.visualstudio.com. Requiring EVERY token to appear in the hostname is
@@ -756,8 +784,15 @@ def identity_signals(candidate: Candidate, name: str, body: str,
 
     # A project's domain may redirect off itself — terraform.io lands on
     # developer.hashicorp.com — so how we arrived counts, not just where.
+    # Not onto a forge, though. There the path names the project and the
+    # host names nobody, which is why `_owns_the_name` refuses forges
+    # outright — and arriving by redirect does not change who owns the host.
+    # `mojo.dev` redirects to an unrelated repository, and crediting that
+    # arrival made `github.com/gdejohn/procrastination` a *verified* answer
+    # for Mojo, off two structural signals and not one mention of the name.
     owns = _owns_the_name(candidate.url, slug)
-    if facts.get("via_domain") or owns:
+    arrived_on_its_own = facts.get("via_domain") and not is_forge(candidate.url)
+    if arrived_on_its_own or owns:
         found.append("own-domain")
 
     # `docs.astro.build` is the project's own documentation host, and that is
@@ -955,6 +990,19 @@ def from_evidence(name: str, state, fetcher: Fetcher, budget=None) -> list[Candi
 CACHE_TTL = 30 * 86400
 REJECT_TTL = 7 * 86400
 
+#: Which set of identity rules decided an entry. Bump it whenever they
+#: change. An answer reached under superseded rules is evidence about the
+#: code that wrote it, not about the name, so `recall` discards it and the
+#: next resolution earns its answer again.
+#:
+#: Written because a fix does not reach a cache. The run that resolved `mojo`
+#: to a Java library filed that as a success, and `CACHE_TTL` would have
+#: served it for thirty days -- outliving the fix by four weeks, on the one
+#: name whose failure prompted the fix. Entries written before this stamp
+#: existed carry no `rules` key and are discarded on sight, which is the
+#: intended effect: they were all decided under rules that have since moved.
+RULES = 1
+
 
 def _cache_file() -> Path:
     return Path(os.environ.get("DOCSFORGE_RESOLVE_CACHE")
@@ -984,6 +1032,8 @@ def recall(name: str) -> Resolution | None:
     entry = _load_cache().get(normalise(name))
     if not entry:
         return None
+    if entry.get("rules") != RULES:
+        return None     # decided under rules this build no longer applies
     age = time.time() - entry.get("at", 0)
     if age > (CACHE_TTL if entry.get("url") else REJECT_TTL):
         return None
@@ -1002,12 +1052,39 @@ def recall(name: str) -> Resolution | None:
     return result
 
 
+#: What `verify()` writes when the request itself failed, as opposed to
+#: succeeding and finding the page documents something else.
+_UNREACHABLE = "could not be read"
+
+
+def learned_nothing(result: Resolution) -> bool:
+    """True when a refusal reflects this machine rather than the name.
+
+    Candidates that could not be *fetched* say nothing about where a project
+    documents itself — they say the network could not answer. Filing that
+    for `REJECT_TTL` turns a passing outage into a week of confident wrong
+    answers, which is exactly what happened to `mojo`: on a NAT64 network
+    every candidate was refused as a "private address", six were found, none
+    could be read, and the refusal was cached for seven days while the cause
+    was fixed within one.
+
+    A refusal reached by actually reading the candidates is a real finding
+    and is still remembered.
+    """
+    if result.best is not None or not result.candidates:
+        return False
+    return all(_UNREACHABLE in (c.reason or "") for c in result.candidates)
+
+
 def remember(name: str, result: Resolution) -> None:
     """File what this resolution found, successful or not."""
+    if learned_nothing(result):
+        return          # nothing was learned, so there is nothing to file
     data = _load_cache()
     best = result.best
     data[normalise(name)] = {
         "at": time.time(),
+        "rules": RULES,
         "url": best.url if best else "",
         "evidence": best.evidence if best else "",
         "reason": best.reason if best else "",
