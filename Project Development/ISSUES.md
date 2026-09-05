@@ -146,6 +146,15 @@ reached before:
   corpus *marked incomplete* would not be presenting it as whole. The choice is
   whether to serve it at all, not whether it can be labelled honestly.
 
+  **The bound itself is gone.** `DOCSFORGE_HARVEST_LINGER` now defaults to `0`,
+  meaning no ceiling. A documentation set is of unknown size until it has been
+  read — measuring coverage is the whole point — so a wall-clock bound was a
+  guess about someone else's site, and one that discarded every page it was
+  supposed to protect. The orphan it guarded against does not need a timer:
+  the wait covers only this process's own harvests, every fetch carries its own
+  timeout, and the page cap bounds the loop, so the wait ends when the work
+  does. A positive value still reimposes a ceiling for anyone who wants one.
+
 ---
 
 ## Resolution

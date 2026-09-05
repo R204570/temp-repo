@@ -315,3 +315,35 @@ def test_the_stdio_server_waits_before_it_exits():
     assert "wait_for_all" in source
     # ...and only for our own, or it would hang on someone else's.
     assert "j.mine" in source
+
+
+def test_the_linger_is_unbounded_by_default():
+    """A documentation set is of unknown size until it has been read, so any
+    wall-clock bound is a guess about someone else's site."""
+    assert harvest_jobs.LINGER == 0
+
+
+def test_an_unbounded_wait_returns_when_the_work_does_not_on_a_timer():
+    import threading
+
+    gate = threading.Event()
+    job = harvest_jobs.start("big", lambda p: gate.wait(30) or "stored")
+    threading.Timer(0.4, gate.set).start()
+
+    began = time.time()
+    assert harvest_jobs.wait_for_all(timeout=0) == 0   # 0 == no bound
+    assert job.state == DONE
+    assert time.time() - began < 10
+
+
+def test_a_positive_bound_still_caps_the_wait():
+    """Removing the default ceiling must not remove the ability to set one."""
+    import threading
+
+    gate = threading.Event()
+    job = harvest_jobs.start("endless", lambda p: gate.wait(30) or "never")
+    try:
+        assert harvest_jobs.wait_for_all(timeout=0.4) == 1
+        assert job.state == RUNNING
+    finally:
+        gate.set()

@@ -184,7 +184,9 @@ def main(argv: list[str] | None = None) -> int:
             abandoned = harvest_jobs.wait_for_all()
             if abandoned:
                 print(f"DocsForge: gave up on {abandoned} harvest(s) after "
-                      f"{harvest_jobs.LINGER:.0f}s", file=sys.stderr, flush=True)
+                      f"{harvest_jobs.LINGER:.0f}s -- set DOCSFORGE_HARVEST_LINGER=0 "
+                      f"to wait for however long a harvest takes",
+                      file=sys.stderr, flush=True)
     return 0
 
 
