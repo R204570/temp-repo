@@ -32,9 +32,33 @@ import reasoning
 import tracing
 import versions
 
-# Cap what we hand back to a model — docs sites can be enormous and blowing the
-# context window helps nobody.
-MAX_CHARS = int(os.environ.get("DOCSFORGE_MAX_CHARS", "60000"))
+# Cap what we hand back to a model. Not a storage limit and never has been:
+# `save_docs` writes through `write_docs`, and the knowledge base stores every
+# page whole, so a file on disk and a row in the store are both unbounded. This
+# bounds one tool result.
+#
+# Raised from 60,000, which was cutting real documentation short — a single
+# large specification page is bigger than that, and being handed a third of one
+# is a poor answer to a question about it.
+#
+# The number cannot simply be removed, and that is worth being precise about:
+# the binding constraint is not DocsForge but the *provider's context window*,
+# and this project speaks to six of them. A result that overflows the window
+# does not truncate gracefully, it fails the turn — so an unbounded default
+# would break Ollama and Groq outright to slightly help Claude. 200,000
+# characters is roughly 50-65k tokens, which sits comfortably inside a
+# 200k-token window alongside the conversation.
+#
+# Where a page is larger still, nothing is lost or hidden: the omission is
+# stated, the sections that were dropped are named, and `read_knowledge_base`
+# takes a `section` so any part of a page can be asked for directly. Callers
+# who know their own window can raise this as far as it will go.
+#: Named so it can be asserted without depending on whatever the machine
+#: running the suite happens to have in its `.env` — one was found setting
+#: `DOCSFORGE_MAX_CHARS` twice, so its real cap was neither this default nor
+#: the first value in its own config.
+DEFAULT_MAX_CHARS = 200_000
+MAX_CHARS = int(os.environ.get("DOCSFORGE_MAX_CHARS", DEFAULT_MAX_CHARS))
 
 # save_docs writes are confined to this root so a model cannot scribble
 # anywhere on the filesystem.

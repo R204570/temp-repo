@@ -35,6 +35,7 @@ from pydantic import Field
 from mcp.server import MCPServer
 
 import forge_tools
+import harvest_jobs
 from docsforge import __version__, enable_utf8_console
 
 server = MCPServer(
@@ -162,6 +163,30 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # stdout is the protocol channel on stdio; never print to it.
         server.run(transport="stdio")
+
+        # `run` returns when the client closes stdin, and this process is
+        # launched per turn by whatever client attached us -- the `claude` CLI
+        # does exactly that. Harvest threads are daemons, so returning here
+        # killed a 561-page langchain harvest at page 59, nine seconds after
+        # `learn_technology` had promised it would keep going. Nothing was
+        # stored and nothing said why.
+        #
+        # So wait for our own harvests before leaving. Bounded, and the
+        # threads are still daemons underneath: whatever has not finished by
+        # then is abandoned rather than orphaning this process forever, and
+        # its status record goes stale and reports itself stopped.
+        # Ours only. Another process's harvest is its own problem, and
+        # waiting on one we cannot even observe finishing would hang.
+        left = [j for j in harvest_jobs.running() if j.mine]
+        if left:
+            print(f"DocsForge: waiting for {len(left)} harvest(s) to finish "
+                  f"before exiting", file=sys.stderr, flush=True)
+            abandoned = harvest_jobs.wait_for_all()
+            if abandoned:
+                print(f"DocsForge: gave up on {abandoned} harvest(s) after "
+                      f"{harvest_jobs.LINGER:.0f}s -- set DOCSFORGE_HARVEST_LINGER=0 "
+                      f"to wait for however long a harvest takes",
+                      file=sys.stderr, flush=True)
     return 0
 
 

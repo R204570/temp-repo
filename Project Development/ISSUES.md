@@ -91,6 +91,70 @@ invisible entirely — a two-second `resolving` never appeared anywhere — so
 `Progress.__setattr__` publishes a phase change at once, while page counts are
 left to the beat because they tick hundreds of times.
 
+### P3 — a background harvest cannot finish under the `claudecode` provider · **DECISION** · partly fixed
+
+Found immediately after P2 shipped, by the tracker P2 added: a langchain
+harvest reported **stopped reporting after 59/561 pages, 34s elapsed**. The
+tracker's first act was to expose a feature that had never worked on that path.
+
+The crawl is not failing. It is being killed:
+
+1. `learn_technology` hands back at the 25s deadline saying the harvest
+   "continues in the background while this server runs".
+2. Under `claudecode` there is no server. The provider spawns the `claude` CLI
+   **per turn** — `Popen`, `proc.wait()`, `proc.kill()` in a `finally` — and
+   the CLI spawns `mcp_server.py` as a child of its own.
+3. The turn ends, the CLI exits, `mcp_server.py` exits.
+4. The harvest runs on a **daemon** thread, and a daemon thread dies with its
+   process. No settle, nothing stored.
+
+25s deadline, plus the model writing its answer, is the 34s. Reproduced in
+isolation with the same harvest and only the daemon flag differing:
+
+    daemon=True    process lived 1.1s   harvest completed: NO
+    daemon=False   process lived 4.0s   harvest completed: YES
+
+Backgrounding has therefore **never** worked on this path. It works in the web
+UI because `app.py` outlives any turn. The 13-page `mojo` in the production
+store is the same death, earlier.
+
+**Partly fixed:** `mcp_server.py` now waits for its own harvests after the
+client hangs up, bounded by `DOCSFORGE_HARVEST_LINGER` (900s). Threads stay
+daemons underneath, so nothing orphans the process forever.
+
+Verified over real stdio, driving `mcp_server.py` as an MCP client does:
+`learn_technology("mojo")` handed back at 3s, stdin was closed — the hang-up —
+and the process lived a further 154s, finished all 213 pages and stored
+3,557,070 bytes as `1.0.0.md`. The console showed the lifecycle it had never
+reached before:
+
+    DocsForge: waiting for 1 harvest(s) to finish before exiting
+    [docsforge] harvest mojo-1: storing
+    [docsforge] harvest mojo-1: done after 155s
+
+**Why this stays a DECISION.** Two gaps the linger does not close:
+
+- **It assumes the client closes stdin and waits.** If Claude Code sends
+  SIGTERM or SIGKILL shortly after hanging up, no in-process fix can help. The
+  robust answer is for the harvest not to be a child of the CLI at all —
+  a detached worker process, or handing the job to the long-lived `app.py` —
+  and that is a real architectural change, not a patch.
+- **Hitting the bound loses everything.** Measured, with a deliberately short
+  bound: ~180 of 213 pages fetched, abandoned, **0 bytes stored**. That is P1
+  again, and it is P1's decision to make — but note that the store already
+  records `complete=False` and an `expected` count, so settling a partial
+  corpus *marked incomplete* would not be presenting it as whole. The choice is
+  whether to serve it at all, not whether it can be labelled honestly.
+
+  **The bound itself is gone.** `DOCSFORGE_HARVEST_LINGER` now defaults to `0`,
+  meaning no ceiling. A documentation set is of unknown size until it has been
+  read — measuring coverage is the whole point — so a wall-clock bound was a
+  guess about someone else's site, and one that discarded every page it was
+  supposed to protect. The orphan it guarded against does not need a timer:
+  the wait covers only this process's own harvests, every fetch carries its own
+  timeout, and the page cap bounds the loop, so the wait ends when the work
+  does. A positive value still reimposes a ceiling for anyone who wants one.
+
 ---
 
 ## Resolution

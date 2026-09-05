@@ -250,3 +250,100 @@ def test_a_different_technology_is_not_blocked_by_a_running_one():
         forge_tools.tool_learn_technology(name="zzzz-not-a-real-package-zzzz")
     except Exception as e:                                  # noqa: BLE001
         assert "langchain" not in str(e)
+
+
+# ── a short-lived host has to wait for its own harvests ────────
+#
+# The langchain failure: `learn_technology` handed back at 25s promising the
+# harvest would keep going, the `claude` CLI ended the turn, the MCP subprocess
+# it had launched exited, and the daemon thread died with it at 59/561 pages.
+# Nothing was stored and nothing said why.
+
+def test_wait_for_all_returns_once_our_harvests_finish():
+    import threading
+
+    gate = threading.Event()
+
+    def work(progress):
+        progress.phase = "harvesting"
+        gate.wait(5)
+        return "stored"
+
+    job = harvest_jobs.start("slow", work)
+    threading.Timer(0.3, gate.set).start()
+
+    began = time.time()
+    abandoned = harvest_jobs.wait_for_all(timeout=10)
+    assert abandoned == 0
+    assert job.state == DONE
+    assert time.time() - began < 5, "should return when the work does"
+
+
+def test_wait_for_all_is_bounded_and_says_what_it_abandoned():
+    """An MCP server outliving its client is an orphan; one that never gives
+    up is worse than a lost harvest."""
+    import threading
+
+    gate = threading.Event()
+    job = harvest_jobs.start("endless", lambda p: gate.wait(30) or "never")
+    try:
+        began = time.time()
+        abandoned = harvest_jobs.wait_for_all(timeout=0.4)
+        assert abandoned == 1
+        assert time.time() - began < 3
+        assert job.state == RUNNING
+    finally:
+        gate.set()
+
+
+def test_wait_for_all_ignores_another_processes_harvest():
+    """Waiting on one we cannot observe finishing would simply hang."""
+    _write_record(id="theirs-1", label="theirs")
+    began = time.time()
+    assert harvest_jobs.wait_for_all(timeout=5) == 0
+    assert time.time() - began < 2, "must not have waited on it"
+
+
+def test_the_stdio_server_waits_before_it_exits():
+    """`server.run(transport=\"stdio\")` returns when the client hangs up, and
+    returning from main is what killed the harvest."""
+    import inspect
+
+    import mcp_server
+
+    source = inspect.getsource(mcp_server.main)
+    assert "wait_for_all" in source
+    # ...and only for our own, or it would hang on someone else's.
+    assert "j.mine" in source
+
+
+def test_the_linger_is_unbounded_by_default():
+    """A documentation set is of unknown size until it has been read, so any
+    wall-clock bound is a guess about someone else's site."""
+    assert harvest_jobs.LINGER == 0
+
+
+def test_an_unbounded_wait_returns_when_the_work_does_not_on_a_timer():
+    import threading
+
+    gate = threading.Event()
+    job = harvest_jobs.start("big", lambda p: gate.wait(30) or "stored")
+    threading.Timer(0.4, gate.set).start()
+
+    began = time.time()
+    assert harvest_jobs.wait_for_all(timeout=0) == 0   # 0 == no bound
+    assert job.state == DONE
+    assert time.time() - began < 10
+
+
+def test_a_positive_bound_still_caps_the_wait():
+    """Removing the default ceiling must not remove the ability to set one."""
+    import threading
+
+    gate = threading.Event()
+    job = harvest_jobs.start("endless", lambda p: gate.wait(30) or "never")
+    try:
+        assert harvest_jobs.wait_for_all(timeout=0.4) == 1
+        assert job.state == RUNNING
+    finally:
+        gate.set()

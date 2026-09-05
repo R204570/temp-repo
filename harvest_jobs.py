@@ -454,6 +454,56 @@ def recent() -> list[Job]:
                   key=lambda j: j.finished, reverse=True)
 
 
+#: How long a short-lived host may linger for its own harvests. **Zero, the
+#: default, means no bound: wait for the harvest however long it takes.**
+#:
+#: It was 900s, and that was wrong. A documentation set is of unknown size
+#: until it has been read — the whole point of measuring coverage is that
+#: nobody knows the page count in advance — so any wall-clock bound is a
+#: guess about someone else's site, and losing a harvest to it costs
+#: everything: measured at a deliberately short bound, ~180 of 213 pages were
+#: fetched and **zero bytes stored**. A bound that discards all the work it
+#: was protecting is not a safety valve.
+#:
+#: The orphan it was guarding against does not need a timer either. This waits
+#: only on harvests *this process started*, every fetch already carries its own
+#: timeout, and the loop is bounded by the page cap — so the wait ends when the
+#: work ends. Set a positive value to reimpose a ceiling.
+LINGER = float(os.environ.get("DOCSFORGE_HARVEST_LINGER", "0"))
+
+
+def wait_for_all(timeout: float | None = None) -> int:
+    """Block until this process's harvests finish. Returns how many did not.
+
+    For a host that exits as soon as its client disconnects. `app.py` never
+    needs this — it outlives any single turn, and Ctrl-C there should not hang
+    for twelve minutes — but the stdio MCP server is launched per turn by the
+    `claude` CLI and torn down with it. Its harvest threads are daemons, so
+    the process exited and took a 561-page langchain harvest with it at page
+    59. Backgrounding cannot work on that path unless somebody waits.
+
+    Still bounded, and still daemon threads underneath: whatever has not
+    finished when the bound expires is abandoned, and its record goes stale
+    and reports itself stopped rather than pretending to still be working.
+    """
+    bound = LINGER if timeout is None else timeout
+    with _LOCK:
+        mine = [j for j in _JOBS.values() if j.state == RUNNING]
+
+    if bound <= 0:                      # no bound: the wait ends when the work does
+        for job in mine:
+            job.done.wait()
+        return 0
+
+    deadline = time.time() + bound
+    for job in mine:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        job.done.wait(left)
+    return sum(1 for j in mine if j.state == RUNNING)
+
+
 def clear() -> None:
     """Forget every job. For tests; does not stop running threads."""
     global _COUNTER
