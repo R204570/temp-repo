@@ -1,7 +1,13 @@
 # llmsfinder: take the file the site already wrote
 
+> **Status: shipped.** All three phases in §6 are built and every acceptance
+> criterion in §7 is met. 740 tests passing, 59 skipped. §§0–9 are kept as
+> written, because what a proposal expected is worth comparing against what it
+> got; **§10 records what the build learned that this document did not
+> anticipate**, and where the two disagree, §10 and the code are right.
+
 Written against the build that implements PROPOSAL-II and PROPOSAL-3 in full —
-648 tests passing, 22 skipped.
+648 tests passing, 22 skipped at the time of writing.
 
 Every previous proposal has been about crawling better: scope it, measure it,
 classify it, overlap it, reason about it. This one is about the case where
@@ -70,8 +76,9 @@ Acquisition is tried in this order, and stops at the first rung that succeeds.
 5. **Sitemap** — already built.
 6. **Crawl** — already built, and now genuinely last.
 
-Rungs 1, 4, 5 and 6 exist today. **Rungs 2 and 3 do not, and they are the whole
-point of this document.**
+Rungs 1, 4, 5 and 6 existed when this was written. **Rungs 2 and 3 did not, and
+they are the whole point of this document.** All six exist now — see §10 for
+what the ladder gained on the way.
 
 ---
 
@@ -187,7 +194,7 @@ Both are read-path work. Neither is optional.
 
 ---
 
-## 6. Phases
+## 6. Phases — all three shipped
 
 **Phase 1 — stop splitting, and say what was stored.** Remove the chunking from
 `handle_llms_txt`; store the dump whole. Fix the two read-path consequences in
@@ -252,3 +259,100 @@ harvests skip that machinery altogether — and the fraction is growing because
 publishing `llms.txt` is becoming standard practice.
 
 The cheapest page to extract correctly is the one that arrived as Markdown.
+
+---
+
+## 10. What the build learned
+
+Everything above treats `llms.txt` as an acquisition question: is there a file,
+what shape is it, how do I read it. The build found a second question sitting
+underneath, and it is the one that decides correctness.
+
+### 10.1 A published file answers "latest", not "which release"
+
+A site publishes **one** `llms.txt`, at its origin, describing what it ships
+today. That makes it the best available answer to one question and a poor
+answer to another, so the *request* picks the pathway, not the file:
+
+- **No release named.** The current documentation is the thing wanted and the
+  published file is it. Probing for one is a cheap sanity check — most sites
+  still publish nothing, and those fall down the ladder exactly as before.
+- **A release named.** The file has to earn it. If it declares a version that
+  answers the request, take it whole. If it files links under that release,
+  narrow to those. If it can show neither, **ignore it and crawl that
+  version's own documentation** — a file published for the current release
+  cannot answer for an older one, and using it anyway is the broadening this
+  system exists to refuse.
+
+§8 said "no trusting `llms.txt` about identity". This is the same sentence
+about *version*: a file at a domain says that domain documents something now,
+not that it documents the release you asked for.
+
+### 10.2 Narrowing has two reasons, and they differ on the root
+
+When only some links survive scoping, whether the file's own prose survives
+with them depends on *why*:
+
+| Narrowed because | The root prose |
+|---|---|
+| the file documents a different **release** | goes — it belongs to that other release |
+| the caller asked for one **section** | stays — the file already showed it covers that section, and the overview is the same site's own words about it |
+
+Deciding this from "were links narrowed?" conflated the two and discarded
+1.1 MB of real documentation on mojolang.org. Deciding it from the reason is
+`Pathway.drop_root`.
+
+### 10.3 Where the file sits, not how we got its URL
+
+The version check was originally gated on our having *probed* for the file, on
+the reasoning that a URL the caller typed is a URL the caller meant. Then the
+caller stopped typing it: resolution improved to the point of returning
+`mojolang.org/llms.txt` directly, and a request for Mojo 0.9 walked straight
+past the check and took the current 1.0.0 manifest whole. A file at the origin
+root is site-wide however its URL reached us; a file below the root —
+`/en/4.2/llms.txt` — is already the one that was asked for and is left alone.
+
+### 10.4 Coverage is three claims, not one
+
+§7 asks that `expected` equal the manifest length. That turned out to be too
+few numbers to be honest with:
+
+- **`expected` counts unique *actionable* pages.** A manifest link may be
+  intentionally excluded — off-site, an anchor into a page already listed — or
+  simply invalid. Counting those inflates the denominator and makes a whole
+  corpus look partial.
+- **The denominator is the site's count, not the slice a page cap left.**
+  Measuring against what was fetched would make cutting a harvest short *look*
+  like completeness.
+- **Root acquisition, manifest acquisition and corpus completeness are recorded
+  apart.** A hybrid whose root stored fine and whose links half-failed is not a
+  whole corpus, and one number cannot say that.
+- **A failure keeps its identity.** Each carries a normalized URL and a coarse
+  category, so a retry can operate on the failed subset instead of reacquiring
+  everything.
+
+### 10.5 A manifest is a crawl, and owes the host the same courtesy
+
+`_crawl_html` has spaced its requests per host since the beginning. The
+manifest path ignored `opts.delay` outright, so the 211-page Mojo harvest went
+out as 211 back-to-back requests. Acquisition here is sequential, so spacing
+the starts is the whole of the politeness — there is never more than one
+request open — and at the default 0.4s it puts the two paths on equal terms.
+
+### 10.6 Measured
+
+`learn_technology("mojo")` from the name alone, into a throwaway store,
+reproduced three times:
+
+| | Before | After |
+|---|---|---|
+| Pages | 329 | **211** |
+| Off-site content | 56% | **0%** |
+| Version label | `2026-09-01` — a harvest date | **`1.0.0`** — the manifest's own declaration |
+
+Fewer pages is the fix, not a regression: the 329 included an entire second
+site the old scoping let in.
+
+`docs.modular.com/mojo/manual/` breadcrumbs to `mojolang.org/docs/manual/`,
+which is how mojolang.org was confirmed as the official host rather than
+assumed.
