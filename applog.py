@@ -93,5 +93,21 @@ def trace_event(trace_id: str, stage: str, state: str, message: str = "") -> Non
            message=(message or "")[:300])
 
 
+def harvest(job: str, label: str, state: str, phase: str = "",
+            pages: int = 0, expected=None, elapsed: float = 0.0,
+            error: str = "") -> None:
+    """A background harvest, at its start, at each phase change, and at its end.
+
+    Written because a harvest that outlives the request deadline left no line
+    anywhere: not here, not on the console, not in `list_knowledge_base`. Grep
+    `"kind": "harvest"` to see every one a process ever started and how each
+    ended -- including the ones that stopped reporting, which is what a killed
+    process looks like from outside.
+    """
+    _write("harvest", job=job, label=label, state=state, phase=phase,
+           pages=pages, expected=expected, elapsed=round(elapsed, 1),
+           error=(error or "")[:300])
+
+
 def error(where: str, message: str) -> None:
     _write("error", where=where, message=(message or "")[:500])

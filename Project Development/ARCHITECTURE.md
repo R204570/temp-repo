@@ -382,7 +382,54 @@ Design constraints that are load-bearing:
 
 **`applog.py`** is what a developer reads: rotating JSONL at `logs/docsforge.log`
 — one line per HTTP request, one per tool call, per turn, per trace event, per
-error. Gitignored, and independent of whether a browser was watching.
+harvest transition, per error. Gitignored, and independent of whether a browser
+was watching.
+
+### A harvest outlives the turn that started it
+
+The trace explains one tool call while you are looking at it. A harvest past
+the 25-second deadline is a different problem: it outlives the call, and with
+the `claudecode` provider it outlives the *process*, because the CLI launches
+`mcp_server.py` itself and every turn gets a fresh subprocess.
+
+So job status is published rather than held in memory:
+
+```mermaid
+flowchart LR
+  subgraph P1["process A · started the harvest"]
+    J["job thread"] --> H["heartbeat, 2s"]
+  end
+  H --> F["~/.docsforge/harvests/&lt;id&gt;.json<br/>phase · pages · expected · state"]
+  J -->|"phase change"| F
+
+  subgraph P2["process B · never heard of it"]
+    LKB["list_knowledge_base"]
+    API["GET /api/harvests"]
+  end
+  F --> LKB
+  F --> API
+  API --> UI["tracker card,<br/>on every page"]
+```
+
+**This is not a job queue and must not become one.** Nothing is ever resumed
+from a record. A harvest still runs on a daemon thread and still dies with its
+process — what changed is that we notice. A record still claiming to run whose
+heartbeat stopped is reported **stalled**, never "running": a dead process
+cannot be distinguished from a slow one except by its silence, and continuing
+to call silence "working" is the failure this exists to prevent.
+
+Three things fall out of the record being shared:
+
+| | Before | Now |
+|---|---|---|
+| `list_knowledge_base` | promised a progress line that a different process could not produce | reports every harvest in flight, whoever started it |
+| A duplicate call | `_still_harvesting` *asked* the model not to; langchain was crawled twice | `learn_technology` checks, and returns the running job's status |
+| A harvest id | a per-process counter, so two harvests were both `langchain-1` | numbered above whatever is already on disk |
+
+A phase change publishes immediately; page counts wait for the beat. A phase
+shorter than the heartbeat was otherwise invisible — a two-second `resolving`
+appeared nowhere at all — while page counts tick hundreds of times and the
+beat is what bounds that to one write every couple of seconds.
 
 ---
 

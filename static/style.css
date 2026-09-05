@@ -882,3 +882,80 @@ textarea.author:focus { outline: none; border-color: var(--accent); }
      squeezing the controls; it takes its own line instead. */
   .acts .stamp { flex: 1 0 100%; margin: 2px 0 0 9px; }
 }
+
+
+/* ── Background harvests ──────────────────────────────────────
+   A harvest that outlives the deadline used to run entirely unseen. The card
+   is fixed rather than in the flow, because it appears on two pages that
+   share nothing but this stylesheet, and it must not move either of them. */
+.harvest-tracker {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 40;
+  width: min(320px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+}
+
+.harvest-title {
+  font-size: 12px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.harvest-row { display: flex; flex-direction: column; gap: 5px; }
+.harvest-head { display: flex; align-items: baseline; gap: 8px; }
+.harvest-name { font-size: 14px; color: var(--text); font-weight: 500; }
+.harvest-time {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.harvest-line { font-size: 13px; color: var(--text-2); }
+
+.harvest-bar {
+  position: relative;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.harvest-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 400ms ease;
+}
+
+/* No denominator, so no claim. The sweep says "working", not "this far". */
+.harvest-bar.unknown i {
+  width: 33%;
+  animation: harvest-sweep 1.4s ease-in-out infinite;
+}
+@keyframes harvest-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
+.harvest-done .harvest-line { color: var(--accent); }
+.harvest-failed .harvest-line,
+.harvest-stalled .harvest-line { color: var(--danger); }
+
+@media (prefers-reduced-motion: reduce) {
+  .harvest-bar i { transition: none; }
+  .harvest-bar.unknown i { animation: none; width: 100%; opacity: .35; }
+}
+
+@media (max-width: 640px) {
+  .harvest-tracker { right: 8px; bottom: 8px; left: 8px; width: auto; }
+}

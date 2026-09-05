@@ -35,6 +35,10 @@ def _isolate_resolution_memory(tmp_path, monkeypatch):
                        str(tmp_path / "resolutions.json"))
     monkeypatch.setenv("DOCSFORGE_SELECTION_POLICY",
                        str(tmp_path / "selection.json"))
+    # Harvest status records default to the same home directory, and a suite
+    # that started background harvests there would show up in the developer's
+    # own `list_knowledge_base` as jobs that stalled.
+    monkeypatch.setenv("DOCSFORGE_HARVEST_STATE", str(tmp_path / "harvests"))
 
 
 @pytest.fixture(autouse=True, scope="session")

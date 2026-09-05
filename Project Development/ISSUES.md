@@ -16,11 +16,16 @@ Status key: `open` · `deferred` (deliberate, revisit later) · `wontfix` ·
 
 ## PROPOSAL-3 acceptance gaps
 
-Two of PROPOSAL-3 §6's own acceptance criteria are **not** met by the four
+Two of PROPOSAL-3 §6's own acceptance criteria were **not** met by the four
 phases. §6 also asks that `ISSUES.md` gain no entries across the four phases,
 so writing these down breaks that rule — deliberately. A criterion met by not
 recording a known gap is met dishonestly, and this file exists precisely so
 that what a project has not done stays as visible as what it has.
+
+P2 is now fixed, and it is worth noting *how* it was found: not by anyone
+re-reading this file, but by a user watching a langchain harvest disappear.
+An entry sitting here open for weeks is a gap the project knows about and has
+stopped seeing.
 
 ### P1 — an interrupted harvest leaves nothing readable, not 60% · **DECISION** · open
 
@@ -42,17 +47,49 @@ and if so how a reader is stopped from mistaking 60% of a manual for the whole
 of one. A `state = 'partial'` that reads only through an explicitly opted-in
 call would satisfy both halves; nothing weaker does.
 
-### P2 — harvest progress does not survive the process · open
+### P2 — harvest progress does not survive the process · **correctness** · fixed
 
 §6 asks that "`list_knowledge_base` reports progress that survives killing the
-process". `harvest_jobs._JOBS` is an in-process dictionary, so it does not: a
-restart loses every running and recently-finished job, and a harvest killed
-mid-flight leaves no trace in the listing at all.
+process". `harvest_jobs._JOBS` was an in-process dictionary, so it did not.
 
-The pages themselves survive — that is Phase 1, and it is the part that
-matters. What is lost is the *report* of them. Fixing it means persisting the
-job table beside the store rather than in memory, which is a small change made
-awkward by the file backend having no obvious place to put it.
+**This was filed as a restart problem and that undersold it.** The damage did
+not need a restart, because there was never one process to begin with. The
+`claudecode` provider launches the CLI, which launches `mcp_server.py` itself,
+so every turn runs its tools in a *fresh subprocess*. So:
+
+- `learn_technology("langchain")` started a harvest in one process and told the
+  user that `list_knowledge_base()` would report it. The next turn's
+  `list_knowledge_base` ran somewhere else, had never heard of the job, and
+  listed 23 technologies with no mention of it. The instruction pointed at a
+  progress line that could not exist.
+- `_still_harvesting` asks the model not to call again, and that request was
+  the *only* thing preventing a duplicate crawl. It held for exactly as long as
+  one process. langchain was crawled twice.
+- `_new_id`'s counter restarted at 1 in each subprocess, so both harvests were
+  `langchain-1` and their records would have collided.
+
+Reported as: *"the harvest is too long that its running in background and there
+is no way to track it or see that it is running neither in terminal, logs nor
+on the web."*
+
+**Fixed** by publishing a status record per job under `~/.docsforge/harvests/`,
+refreshed on a two-second heartbeat and read by every process. Explicitly *not*
+a job queue: nothing is resumed from a record, and the module docstring still
+says so. A harvest still dies with its process — what changed is that we now
+notice. A record still claiming to run whose heartbeat stopped is reported
+**stalled**, never "running", because a daemon thread dies with its process and
+continuing to call that "working" is the lie the whole mechanism exists to
+avoid.
+
+Around it: `/api/harvests`, a tracker card on both pages, an
+`applog.harvest` line and a console line on every phase transition, and
+`learn_technology` now *checking* for a running harvest of the same name
+instead of politely asking the model not to start one.
+
+The phase hook is worth keeping in mind: a phase shorter than the heartbeat was
+invisible entirely — a two-second `resolving` never appeared anywhere — so
+`Progress.__setattr__` publishes a phase change at once, while page counts are
+left to the beat because they tick hundreds of times.
 
 ---
 

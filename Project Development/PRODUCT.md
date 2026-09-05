@@ -56,7 +56,7 @@ The user's stated goal for this build remains experimental: to find out whether 
 - A resolution is remembered for 30 days, a refusal for 7, and both are clearable with `forget_resolution`. Two things are never filed: an answer nothing could be read to reach — that is the network talking, not the name — and an entry decided under identity rules this build no longer applies, which is discarded on recall so a fix reaches the cache instead of being outlived by it.
 - Harvests are stored and versioned. Two versions of one library are kept side by side rather than one overwriting the other, because they contradict each other.
 - Storage is Markdown files by default; setting `DOCSFORGE_DB` moves it to Postgres with a full-text index. The zero-key, one-command path stays the default.
-- Long harvests run in the background and report progress through `list_knowledge_base`. Jobs live in the server process and are not persisted — the durable record of a harvest is the knowledge-base entry it writes.
+- Long harvests run in the background and report progress through `list_knowledge_base`, a tracker card in the panel, `GET /api/harvests`, and a line in the log and on the console at every phase change. Each job publishes a small status record under `~/.docsforge/harvests/` so a harvest started in one process is visible from another — which matters because the `claudecode` provider runs each turn's tools in a subprocess of its own. It is not a queue: nothing is resumed from a record, a harvest still dies with its process, and a record whose heartbeat stopped is reported *stalled* rather than left claiming to work. The durable record of a harvest is still the knowledge-base entry it writes.
 - Every tool call is inspectable. Clicking its row in the panel opens a nested, live execution trace — what was run, with what input, and what came back — streamed incrementally over its own connection so a three-minute harvest is watchable for three minutes rather than explained after the fact. A parallel JSONL log at `logs/docsforge.log` records the same run for a developer who was not watching.
 - Replies are always Markdown; the panel renders it and offers raw `.md`, copy, and download.
 - Tool results are capped at 60,000 characters with an explicit truncation marker.
@@ -74,7 +74,7 @@ Name: **DocsForge**. It is a component of **FlowIT** and will be embedded in it.
 
 Real and verified in this build — do not fabricate beyond it:
 
-- 740 passing offline unit tests (`tests/`), 59 skipped behind opt-in gates (live network, Postgres, browser rendering). Verified by a full run, not asserted.
+- 757 passing offline unit tests (`tests/`), 59 skipped behind opt-in gates (live network, Postgres, browser rendering). Verified by a full run, not asserted.
 - Live extraction against `petstore3.swagger.io`, `github.com/psf/requests`, `docs.python.org`, and a crawl of `fastapi.tiangolo.com`; plus live smoke tests for MCP stdio, the web API, and a two-turn conversation.
 - A full `learn_technology("mojo")` from the name alone, into a throwaway store, reproduced three times: 211 pages, 3,403,639 characters, entirely from `mojolang.org`, labelled `1.0.0` from the manifest's own declaration, in 125–205s.
 - Installable: `pyproject.toml` ships `docsforge` and `docsforge-mcp` console scripts, both verified to run from an editable install.

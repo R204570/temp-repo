@@ -220,6 +220,15 @@ watchable for three minutes, a failure is attached to the operation that caused
 it, and where a page had to be clipped the row says how much it left out. There
 are no invented percentages — a progress figure appears only where there is a
 real denominator to divide by, such as a manifest's own page count.
+A harvest too big to finish inside the request keeps going in the background,
+and a card in the corner shows what it is doing — the phase, the page count,
+and how long it has been going — on the chat and in DocsStore alike. Where the
+source states how many pages it has, the card fills a bar; where it does not —
+a crawl discovers its frontier as it walks it — you get elapsed time and a page
+count and no invented percentage. DocsStore refreshes itself the moment one
+lands. The same transitions go to `logs/docsforge.log` and to the console, so
+a harvest is watchable without a browser open.
+
 Each answer carries **Copy / Download .md / Edit**, because the Markdown is
 something you keep, not just something you read. The send button becomes a stop
 button while an answer streams, and stopping keeps what already arrived.
@@ -725,8 +734,12 @@ whose pitch is calibrated confidence cannot be selective about its own.
   one is the failure this project exists to refuse. Whether it should be
   readable behind an explicit opt-in is an open question.
 - **Background harvests do not survive a restart.** The pages do — they are
-  written as they are fetched — but the *report* of a running harvest is
-  in-process, so a killed process loses track of it.
+  written as they are fetched — and the *report* of one is now visible from any
+  process, so a harvest started by the MCP subprocess shows up in the panel and
+  in `list_knowledge_base`. What still does not survive is the harvest itself:
+  it runs on a daemon thread and dies with its process. When that happens the
+  tracker says the harvest **stopped reporting** rather than leaving it
+  spinning, because a dead process and a slow one differ only in their silence.
 
 `Project Development/` holds the design record: three proposals, an audit, and
 the measurements behind each threshold. `PROPOSAL-II.md` (federation, intent,
