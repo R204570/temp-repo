@@ -907,6 +907,11 @@ pagerEl.addEventListener("click", (e) => {
 
 window.addEventListener("hashchange", open);
 
+// A background harvest finishing is the one thing that changes this listing
+// without the user doing anything, and it used to appear only on a manual
+// reload -- the documentation simply materialising some minutes later.
+window.addEventListener("docsforge:harvest-finished", () => { open(); });
+
 document.addEventListener("keydown", (e) => {
   const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
   if (e.key === "Escape" && typing) { document.activeElement.blur(); return; }

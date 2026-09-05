@@ -1201,6 +1201,20 @@ def tool_learn_technology(name: str, version: str | None = None,
             if trace.is_detached():
                 trace.close()
 
+    # Already being fetched? Say so rather than crawl the site twice.
+    #
+    # `_still_harvesting` has always told the model not to call again, and
+    # that instruction was the only thing preventing it -- which held for
+    # exactly as long as one process. The `claudecode` provider runs each
+    # turn's tools in a fresh subprocess, so the second call landed somewhere
+    # that had never heard of the first, and langchain was crawled twice.
+    # Now that a running harvest is visible from any process, this is a check
+    # rather than a request.
+    wanted = _kb_slug(_normalise(name) or name)
+    for other in harvest_jobs.running():
+        if _kb_slug(_normalise(other.label) or other.label) == wanted:
+            return _still_harvesting(other)
+
     # The harvest starts on its own thread and we wait on it -- but only up to
     # the deadline. Anything finishing in time returns exactly what it always
     # returned, which is nearly every harvest and every test.

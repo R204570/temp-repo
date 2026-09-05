@@ -39,6 +39,7 @@ load_dotenv(find_dotenv(usecwd=True))
 
 import applog  # noqa: E402
 import forge_tools  # noqa: E402  (after load_dotenv so tool config sees .env)
+import harvest_jobs  # noqa: E402
 import providers  # noqa: E402
 import tracing  # noqa: E402
 from docsforge import enable_utf8_console  # noqa: E402
@@ -524,6 +525,28 @@ def config():
         "provider": providers.default_name(),
         "ready": any(p["available"] for p in catalog),
         "tools": [{"name": t.name, "description": t.description} for t in forge_tools.TOOLS],
+    }
+
+
+@app.get("/api/harvests")
+def harvests():
+    """Every harvest in flight, and how the recent ones ended.
+
+    A background harvest used to be visible only to the process that started
+    it, and with the `claudecode` provider that is a subprocess which exits
+    with the turn. So a harvest ran for minutes with nothing to watch: not in
+    the panel, not in the log, not in `list_knowledge_base` — and then its
+    documentation simply appeared in DocsStore, as though from nowhere.
+
+    `fraction` is null wherever there is no honest denominator. A manifest
+    states how many pages it lists; a crawl's frontier grows as it is walked,
+    and dividing by it would be inventing a number.
+    """
+    live = [j.as_dict() for j in harvest_jobs.running()]
+    return {
+        "running": live,
+        "recent": [j.as_dict() for j in harvest_jobs.recent()[:10]],
+        "count": len(live),
     }
 
 

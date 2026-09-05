@@ -163,6 +163,34 @@ measure.
 Truncation is stated, never silent: strings clip at 4,000 characters and
 outputs at 20,000, and the row says how much it left out.
 
+## Harvest tracker
+
+A fixed card, bottom-right, on both the chat and DocsStore. When nothing is
+being harvested there is no card — this is the only element on either page that
+appears unprompted, so it has to earn the space every time.
+
+It owns no layout. The two pages share nothing but `style.css`, and a strip in
+the flow would have had to be placed twice and would move the transcript under
+a reader mid-sentence. Below 640px it spans the width instead of floating, and
+at 420px the page still does not scroll sideways.
+
+One row per harvest: the name, elapsed time in monospace, and what it is doing
+right now. **The bar is drawn only where there is a real denominator.** A
+manifest states how many pages it lists, so `41/213` fills to 19%. A crawl's
+frontier grows as it is walked, so there is no fraction to show and the row
+gets an indeterminate sweep that says "working" without implying how far along
+it is. Inventing that number would be the same lie as a coverage figure nobody
+measured.
+
+A harvest that stops reporting says so in `--danger` and names the likely
+cause, rather than spinning forever. Finished harvests linger twenty seconds
+and then go; DocsStore refreshes itself when one lands, because the whole
+complaint was documentation appearing there as though from nowhere.
+
+Polling, not SSE: two seconds while something runs, fifteen when nothing does,
+and a catch-up when a hidden tab comes back. The trace needed a stream because
+it is a nested log that must arrive in order; this is four numbers.
+
 ## Icons
 
 Authored 1-bit SVG `<symbol>`s inline at the top of each page, all on a 24px
@@ -235,6 +263,11 @@ Every view is addressable: `#/effect/v3/41`.
   off the palette. Every text pair clears 4.5:1; the lowest are the placeholder
   at 5.24:1 and the send glyph on the accent at 4.87:1. Search highlight —
   accent on a 13% accent tint over near-black — measures 7.72:1.
+- The harvest tracker driven in a real browser at 1440 and 420, on both pages,
+  with two harvests seeded as another process would have left them: the row
+  with a denominator fills to 19% and the crawl without one draws the
+  indeterminate sweep and no number, console clean, no horizontal overflow at
+  either width.
 - The trace driven rather than eyeballed: a work row opens on click and on
   `Enter`, `aria-expanded` tracks the panel, a stage re-emitted with the same id
   replaces its row instead of adding one, and a harvest that finishes after the
