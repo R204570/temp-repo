@@ -454,6 +454,37 @@ def recent() -> list[Job]:
                   key=lambda j: j.finished, reverse=True)
 
 
+#: How long a short-lived host may linger for its own harvests. Bounded
+#: because an MCP server outliving its client is an orphan, and an orphan that
+#: never gives up is worse than a lost harvest.
+LINGER = float(os.environ.get("DOCSFORGE_HARVEST_LINGER", "900"))
+
+
+def wait_for_all(timeout: float | None = None) -> int:
+    """Block until this process's harvests finish. Returns how many did not.
+
+    For a host that exits as soon as its client disconnects. `app.py` never
+    needs this — it outlives any single turn, and Ctrl-C there should not hang
+    for twelve minutes — but the stdio MCP server is launched per turn by the
+    `claude` CLI and torn down with it. Its harvest threads are daemons, so
+    the process exited and took a 561-page langchain harvest with it at page
+    59. Backgrounding cannot work on that path unless somebody waits.
+
+    Still bounded, and still daemon threads underneath: whatever has not
+    finished when the bound expires is abandoned, and its record goes stale
+    and reports itself stopped rather than pretending to still be working.
+    """
+    deadline = time.time() + (LINGER if timeout is None else timeout)
+    with _LOCK:
+        mine = [j for j in _JOBS.values() if j.state == RUNNING]
+    for job in mine:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        job.done.wait(left)
+    return sum(1 for j in mine if j.state == RUNNING)
+
+
 def clear() -> None:
     """Forget every job. For tests; does not stop running threads."""
     global _COUNTER
