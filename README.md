@@ -284,7 +284,7 @@ Everything is optional; see `.env.example` for the full list.
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Where the Ollama daemon listens. |
 | `OLLAMA_MODEL` | auto | Pin a local model; otherwise the best tool-capable one installed. |
 | `GITHUB_TOKEN` | — | Raises the GitHub API rate limit. |
-| `DOCSFORGE_MAX_CHARS` | `60000` | Largest tool result returned to a model. |
+| `DOCSFORGE_MAX_CHARS` | `200000` | Largest tool result returned to a model. Not a storage limit — files and the knowledge base keep every page whole. Raise it if your provider's context window allows; the cap exists because a result that overflows the window fails the turn rather than truncating. |
 | `DOCSFORGE_OUT_ROOT` | `./docs_md` | Directory `save_docs` may write into. |
 | `DOCSFORGE_ALLOW_PRIVATE` | unset | Allow fetching private/loopback addresses. |
 | `DOCSFORGE_ALLOW_DELETE` | unset | Let the **model** delete stored documentation. Off by default — see below. |

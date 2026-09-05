@@ -18,8 +18,13 @@ import pytest
 #:   DOCSFORGE_TEST_DB=postgresql://postgres:pw@127.0.0.1:5432/DocsForge
 TEST_DB_VAR = "DOCSFORGE_TEST_DB"
 
+#: `DOCSFORGE_MAX_CHARS` is here for the same reason as the rest: a developer's
+#: own `.env` should not decide what the suite asserts. One was found setting it
+#: twice — 60000 then 80000 — so the machine's real read cap was neither the
+#: code's default nor the first line of its own config.
 _PRODUCTION_VARS = ("DOCSFORGE_DB", "DATABASE_URL", "DOCSFORGE_KB_ROOT",
-                    "DOCSFORGE_OUT_ROOT", "DOCSFORGE_SEARCH")
+                    "DOCSFORGE_OUT_ROOT", "DOCSFORGE_SEARCH",
+                    "DOCSFORGE_MAX_CHARS")
 
 
 @pytest.fixture(autouse=True)
