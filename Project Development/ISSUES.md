@@ -143,10 +143,43 @@ reached before:
 
   A client teardown kills. The linger handles the case that does not happen.
 
-  **Fixed** by `harvest_worker.py`: under a short-lived host the harvest runs
-  in a process of its own, launched detached, which outlives everyone. End to
-  end with the MCP server killed twelve seconds in, the harvest went on to
-  209/307 pages and stored 3,563,589 bytes.
+  ~~**Fixed** by `harvest_worker.py`: a process of its own, launched
+  detached.~~ **That was wrong, and it shipped.** It survives the parent being
+  killed and *not* the parent's **job object**, which is how a client actually
+  tears its children down. Windows kills every process in a job with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, detached or not:
+
+      detached only          tick 4 -> 4      DIED
+      detached + breakaway   never started    DIED
+
+  `CREATE_BREAKAWAY_FROM_JOB` is not an escape either: it is refused unless the
+  job grants it, and the child then fails to start at all.
+
+  The test that passed it killed the immediate parent, which is not the same
+  event. A fix verified against the wrong mechanism is a fix nobody has tested.
+  (The first version of the job-object measurement above was *also* wrong —
+  `AssignProcessToJobObject` was failing with `ERROR_INVALID_HANDLE` because
+  ctypes truncates a 64-bit `HANDLE` to `c_int`, so both arms "survived" a job
+  that had never been applied. Checking the return codes is what turned an
+  encouraging result into a real one.)
+
+  **Fixed** by handing the work to a process that was never in that job. The
+  DocsForge server is long-lived, outside the CLI entirely, and already the
+  host where background harvests have always worked: `POST /api/harvests`
+  reserves a record, starts the harvest there, and returns the id, which every
+  other process watches exactly as before.
+
+  Verified with the MCP server inside a real kill-on-close job object, the job
+  closed fifteen seconds in: the harvest ran **417 seconds** and stored
+  **3,563,589 bytes**.
+
+  When no server answers, the harvest runs locally as before **and the result
+  says so** — "this harvest will stop when this turn ends" — because the silent
+  version of that is what killed three langchain harvests without a word.
+
+  `harvest_worker.py` and `spawn_detached` are deleted rather than kept as a
+  fallback. Code a measurement disproved is how the next person rediscovers
+  this the hard way.
 
   Five bugs on the way there, every one of them silent:
 

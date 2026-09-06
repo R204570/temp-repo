@@ -1250,7 +1250,7 @@ def tool_learn_technology(name: str, version: str | None = None,
         # without this the worker reads its own record, concludes the harvest
         # is already in hand, and returns having done nothing — which is
         # exactly what happened, silently, three times over.
-        if other.id and other.id == harvest_jobs.ADOPT:
+        if other.id and other.id == harvest_jobs.adopting():
             continue
         if _kb_slug(_normalise(other.label) or other.label) == wanted:
             return _still_harvesting(other)
@@ -1262,17 +1262,26 @@ def tool_learn_technology(name: str, version: str | None = None,
     # detached harvest that finishes inside the deadline still returns its own
     # summary: the worker writes the result into the record and we read it back.
     if harvest_jobs.DETACHED:
-        spawned = harvest_jobs.spawn_detached(
-            name, "learn_technology",
+        handed = harvest_jobs.hand_off(
+            name,
             {"name": name, "version": version, "max_pages": max_pages,
              "js": js, "intent": intent, "corpora": corpora, "strict": strict})
-        settled = harvest_jobs.await_record(spawned.id, harvest_jobs.DEADLINE)
-        if settled is not None and settled.state == harvest_jobs.DONE:
-            return settled.result
-        if settled is not None and settled.state == harvest_jobs.FAILED:
-            raise ForgeError(settled.error or f"Harvesting {name!r} failed.")
-        trace.detach()
-        return _still_harvesting(harvest_jobs.get(spawned.id) or spawned)
+        if handed is not None:
+            # Watched exactly as a local job would be, so a harvest small
+            # enough to finish inside the deadline still returns its own
+            # summary rather than a progress line.
+            settled = harvest_jobs.await_record(handed.id, harvest_jobs.DEADLINE)
+            if settled is not None and settled.state == harvest_jobs.DONE:
+                return settled.result
+            if settled is not None and settled.state == harvest_jobs.FAILED:
+                raise ForgeError(settled.error or f"Harvesting {name!r} failed.")
+            trace.detach()
+            return _still_harvesting(harvest_jobs.get(handed.id) or handed)
+        # Nobody answered. Run it here and say plainly that it will not
+        # outlive this turn — a promise of background work this host cannot
+        # keep is what sent three langchain harvests to their deaths without
+        # a word.
+        _log_no_server()
 
     # The harvest starts on its own thread and we wait on it -- but only up to
     # the deadline. Anything finishing in time returns exactly what it always
@@ -1290,6 +1299,31 @@ def tool_learn_technology(name: str, version: str | None = None,
     # still emitting -- keeps going on its own thread after this line.
     trace.detach()
     return _still_harvesting(job)
+
+
+#: Set once a handoff has failed, so the warning is attached to the result
+#: rather than only written to a log the caller never reads.
+_NO_SERVER = threading.local()
+
+
+def _log_no_server() -> None:
+    _NO_SERVER.value = True
+    applog.error("harvest_handoff",
+                 f"no DocsForge server at {harvest_jobs.SERVER}; the harvest "
+                 f"will not outlive this process")
+
+
+def _server_warning() -> str:
+    """What to add when a harvest is running somewhere that cannot keep it."""
+    if not getattr(_NO_SERVER, "value", False):
+        return ""
+    _NO_SERVER.value = False
+    return (
+        f"\n\n**This harvest will stop when this turn ends.** No DocsForge "
+        f"server answered at {harvest_jobs.SERVER}, so it is running inside a "
+        f"process the client tears down — start `python app.py` and ask again "
+        f"to have it run somewhere that survives."
+    )
 
 
 def _still_harvesting(job: harvest_jobs.Job) -> str:
@@ -1313,6 +1347,7 @@ def _still_harvesting(job: harvest_jobs.Job) -> str:
         f"- **Do not call learn_technology for {job.label!r} again** - it is "
         f"already running, and a second call would crawl the same site twice.\n\n"
         f"Tell the user it is being fetched now rather than reporting a failure."
+        + _server_warning()
     )
 
 

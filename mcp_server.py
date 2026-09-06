@@ -162,15 +162,18 @@ def main(argv: list[str] | None = None) -> int:
         server.run(transport="streamable-http", host=args.host, port=args.port)
     else:
         # This process is launched per turn by whatever client attached us --
-        # the `claude` CLI does exactly that -- and is torn down with it. A
-        # harvest on a thread here dies with us, and a teardown *kills* rather
-        # than closing politely, so the wait below cannot save one either.
-        # Measured, driving this server over stdio with a harvest in flight:
+        # the `claude` CLI does exactly that -- and is torn down with it,
+        # together with its whole job object. Nothing started here can outlive
+        # the turn: a thread dies with the process, the wait below only helps
+        # a polite hang-up, and a detached child is killed with the job anyway.
+        # Measured, all three:
         #
-        #     close-stdin   process lived a further 232s   stored: 1.0.0.md
-        #     kill          process lived a further   2s   stored: NOTHING
+        #     close-stdin            lived a further 232s   stored: 1.0.0.md
+        #     kill                   lived a further   2s   stored: NOTHING
+        #     detached, job closed   tick 4 -> 4            DIED
         #
-        # So harvests started here run in a process of their own.
+        # So a harvest asked for here is handed to the long-lived DocsForge
+        # server, which was never in this job.
         harvest_jobs.DETACHED = True
 
         # stdout is the protocol channel on stdio; never print to it.
