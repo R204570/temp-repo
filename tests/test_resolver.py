@@ -547,3 +547,64 @@ def test_the_lang_shapes_cost_four_probes(monkeypatch):
     full NAME_TLDS spread would be latency for nothing."""
     probed = _origins_probed_for("zig", monkeypatch)
     assert len(probed) == len(resolver.NAME_TLDS) + 4
+
+
+# --- choosing between candidates that all verify -----------------------------
+#
+# `resolve()` used to stop at the first candidate that passed, walking in
+# confidence order — and confidence there is a prior about the *source type*,
+# decided before anything was read. `pypi:Documentation` outranks
+# `pypi:Homepage`, so `langchain` resolved to `reference.langchain.com` (an API
+# symbol index: 560 pages, median 490 characters, one attribute per page) while
+# `docs.langchain.com` sat second at 0.78 and was never even checked.
+
+def _cand(url, signals, confidence=0.5, source="pypi:Homepage"):
+    c = Candidate(url, source, confidence, "", True, "")
+    c.signals = list(signals)
+    return c
+
+
+def test_the_projects_own_docs_host_beats_its_reference_site():
+    """The live case, as the signals it actually produced."""
+    reference = _cand("https://reference.langchain.com/python/langchain/langchain/",
+                      ["own-domain", "names-it:11"], 0.92, "pypi:Documentation")
+    docs = _cand("https://docs.langchain.com/", ["own-domain", "docs-host"], 0.78)
+
+    assert resolver.best_verified([reference, docs]) is docs
+    assert resolver.best_verified([docs, reference]) is docs, "order must not decide"
+
+
+def test_a_source_repository_never_outranks_a_documentation_site():
+    """Counting signals was tried first and was worse: a repo page is dense
+    with the name and carries a backlink, so it won on raw totals."""
+    repo = _cand("https://github.com/langchain-ai/langchainjs/tree/main/libs/langchain/",
+                 ["repo-backlink", "registry-agreement", "names-it:18"], 0.35)
+    docs = _cand("https://docs.langchain.com/", ["own-domain", "docs-host"], 0.78)
+
+    assert resolver.best_verified([repo, docs]) is docs
+    assert resolver.evidence(repo) < resolver.evidence(docs)
+
+
+def test_a_repository_still_wins_when_it_is_all_there_is():
+    """Many small libraries really do document themselves in a README.
+    Demotion must not become refusal."""
+    repo = _cand("https://github.com/someone/tiny", ["repo-identity", "names-it:9"])
+    assert resolver.best_verified([repo]) is repo
+
+
+def test_owning_the_domain_beats_not_owning_it():
+    theirs = _cand("https://someblog.example/htmx-guide", ["install:npm", "names-it:30"])
+    ours = _cand("https://htmx.org/", ["own-domain", "names-it:12"])
+    assert resolver.best_verified([theirs, ours]) is ours
+
+
+def test_mentions_only_break_a_tie_between_equals():
+    quiet = _cand("https://a.dev/", ["own-domain", "names-it:3"])
+    loud = _cand("https://b.dev/", ["own-domain", "names-it:40"])
+    assert resolver.best_verified([quiet, loud]) is loud
+
+
+def test_nothing_verified_means_no_answer():
+    a = Candidate("https://a.dev/", "pypi:Homepage", 0.9, "", False, "no")
+    b = Candidate("https://b.dev/", "pypi:Homepage", 0.8, "", None, "")
+    assert resolver.best_verified([a, b]) is None

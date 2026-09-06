@@ -220,13 +220,52 @@ parked and marketing page now carries a GitHub link, so the gate passes them.
 Cheaper than R1 and probably fixes most of R1's cases: require more than one
 software marker, or discount a page whose only marker is a footer link.
 
-### R3 — `resolve()` returns the first verified candidate, not the best-evidenced · open
+### R3 — `resolve()` returns the first verified candidate, not the best-evidenced · **correctness** · fixed
 
-The verify loop breaks on the first candidate that passes, in shape order. So
-`githubactions.com` (concat shape, tried early) beats `docs.github.com/actions`
-(portal shape, tried later) even though the latter would carry more signals.
-Ranking verified candidates by signal strength would fix it. Behaviour change;
-needs its own measurement run.
+The verify loop broke on the first candidate that passed, walking in
+`confidence` order — and confidence there is a prior about the **source type**,
+decided before anything has been read. `pypi:Documentation` outranks
+`pypi:Homepage`, so `langchain` resolved to `reference.langchain.com` and
+`docs.langchain.com` sat second at 0.78 and was **never checked at all**. The
+winner was not better, it was earlier.
+
+Found by auditing a stored corpus rather than by reading this entry: the
+langchain harvest was 560 pages and only 669,048 characters — a median page of
+490 characters, because every page is one API symbol. `docs.langchain.com`
+samples at a median of 5,023.
+
+**Fixed** by `best_verified()`: read every candidate, then compare.
+
+**Counting signals was tried first and was worse.** A GitHub repository page is
+dense with the project's name and carries a backlink and a registry agreement —
+two strong signals and eighteen mentions — so `langchain` then resolved to
+`github.com/langchain-ai/langchainjs/tree/main/libs/langchain/`, a source tree.
+Caught by measuring rather than by assuming.
+
+So `evidence()` ranks on what the signals *mean* before it counts them:
+source-or-documentation first (a forge loses to a docs site, but still wins when
+it is all there is — plenty of small libraries genuinely document themselves in
+a README), then `docs-host` (owns the name *and* is a docs host), then
+`own-domain`, and only then strong count, mentions, and confidence as a tiebreak.
+
+Measured over ten names, one fixed and one improved, no regressions:
+
+    langchain   reference.langchain.com  ->  docs.langchain.com
+    astro       astro.build              ->  docs.astro.build
+    mojo, zig, nim, fastapi, pydantic, htmx      unchanged
+
+`astro` is the instructive one: `astro.build` carries **five** strong signals
+and sixty mentions against `docs.astro.build`'s two, and still loses. That is
+R5's class of failure — landing on a marketing homepage rather than the docs
+root — falling out of ranking by meaning.
+
+Reading every candidate costs more requests than stopping at the first. The
+ladder's own budget still bounds it, and a resolution that cannot compare
+cannot be said to have chosen.
+
+**Not closed by this:** `effect` still resolves to `effect.website` rather than
+its `/docs/` root, and `polars` still reaches `polars.dev` with a single
+candidate — R5 and R1 respectively, both untouched here.
 
 ### R4 — nine multi-word names still refuse · deferred
 
