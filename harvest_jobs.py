@@ -389,15 +389,14 @@ def start(label: str, work: Callable[[Progress], str],
 
     `job_id` adopts an id somebody else already published, which is how a
     detached worker continues the record its launcher created rather than
-    minting a second one for the same harvest. `ADOPT` is the same thing for
+    minting a second one for the same harvest. `adopt()` is the same thing for
     a caller that cannot reach this argument — `tool_learn_technology` builds
-    its own `work` and calls this itself, so the worker leaves the id here
+    its own `work` and calls this itself, so the launcher leaves the id there
     instead of threading a parameter through the tool layer.
     """
-    global ADOPT
+    adopted = job_id or adopting()
+    adopt("")
     with _LOCK:
-        adopted = job_id or ADOPT
-        ADOPT = ""
         job = Job(id=adopted or _new_id(label), label=label,
                   started=time.time(), pid=os.getpid())
         _JOBS[job.id] = job
@@ -447,98 +446,106 @@ def start(label: str, work: Callable[[Progress], str],
     return job
 
 
-#: Run harvests in a process of their own rather than on a thread here.
+#: This host will be torn down with the turn, so a harvest started here has to
+#: be run somewhere else. Off by default — `app.py` outlives any turn, and a
+#: thread there is simpler and feeds the live trace. The stdio MCP server turns
+#: it on, because the `claude` CLI launches it per turn and tears it down.
 #:
-#: Off by default, because `app.py` is the common host and it outlives any
-#: turn — a thread there is simpler, and it is what feeds the live trace.
-#: The stdio MCP server turns it on, because it is launched per turn by the
-#: `claude` CLI and torn down with it.
+#: Three attempts, each measured, because each of the first two looked right:
 #:
-#: Measured, driving the real server over stdio with a harvest in flight:
+#:   1. **Wait for the harvest before exiting.** Works when the client closes
+#:      stdin; useless when it kills.
 #:
-#:     close-stdin   process lived a further 232s   stored: 1.0.0.md
-#:     kill          process lived a further   2s   stored: NOTHING
+#:          close-stdin   lived a further 232s   stored: 1.0.0.md
+#:          kill          lived a further   2s   stored: NOTHING
 #:
-#: The linger added for the first case is powerless against the second, and
-#: the second is what a client teardown actually does. Nothing that runs
-#: inside a process someone else owns can survive being killed — so the
-#: harvest has to stop being a child of the CLI.
+#:   2. **Spawn it `DETACHED_PROCESS`.** Survives the parent being killed —
+#:      and *not* the parent's **job object**, which is how a client actually
+#:      tears its children down. Windows kills every process in a job with
+#:      `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, detached or not:
+#:
+#:          detached only          tick 4 -> 4      DIED
+#:          detached + breakaway   never started    DIED
+#:
+#:      `CREATE_BREAKAWAY_FROM_JOB` is not the escape either: it is refused
+#:      unless the job grants it, and the child then fails to start at all.
+#:
+#:   3. **Hand it to a process that was never in that job.** There is one:
+#:      the DocsForge server. It is long-lived, outside the CLI entirely, and
+#:      already the host where harvests have always worked.
+#:
+#: No spawn flag can win this. Whoever owns the job decides, so the work has to
+#: begin somewhere the job never reached.
 DETACHED = False
 
-#: An id the next `start()` should adopt instead of minting one. Set by the
-#: detached worker, consumed once. Module state rather than a parameter
-#: because the call that needs it is inside the tool layer, several frames
-#: from anything the worker can reach.
-ADOPT = ""
+#: Where the long-lived server listens. A harvest is handed to it rather than
+#: started here; `app.py`'s own default port, overridable for a server on
+#: another port or host.
+SERVER = os.environ.get("DOCSFORGE_SERVER", "http://127.0.0.1:8000")
+
+#: Long enough to cross a loopback request to a busy server, short enough that
+#: a caller waiting on a tool call does not notice when nothing is listening.
+HANDOFF_TIMEOUT = 5.0
 
 
-def _worker_script() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "harvest_worker.py")
+def reserve(label: str) -> Job:
+    """Publish a record for work that is about to begin, and return it.
 
-
-def spawn_detached(label: str, tool: str, kwargs: dict) -> Job:
-    """Run one harvest in a process that outlives whatever launched it.
-
-    The record is published *here*, before the worker exists, so a caller
-    never sees a gap where the harvest it just asked for cannot be found.
-    The worker then adopts that id and takes the record over.
-
-    Deliberately still not a queue: nothing is resumed, nothing is retried,
-    and a worker that dies leaves a record whose heartbeat stops and which is
-    therefore reported stalled. What changed is only *whose* death takes the
-    harvest with it.
+    Before the thread, deliberately: a caller handed an id must be able to
+    find it immediately, and a gap where the harvest it just asked for cannot
+    be found is exactly what this whole mechanism exists to close.
     """
     with _LOCK:
-        job = Job(id=_new_id(label), label=label, started=time.time())
-    _publish(job)                       # exists before the worker does
+        job = Job(id=_new_id(label), label=label, started=time.time(),
+                  pid=os.getpid())
+    _publish(job)
     _announce(job)
-
-    directory = state_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    spec = directory / f"{job.id}.spec.json"
-    spec.write_text(json.dumps({"job": job.id, "label": label,
-                                "tool": tool, "kwargs": kwargs}),
-                    encoding="utf-8")
-
-    creation = 0
-    if os.name == "nt":
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console, and no
-        # Ctrl-C delivered to us because somebody signalled our parent.
-        creation = 0x00000008 | 0x00000200
-
-    # Its own log, beside its record. A detached process whose output goes to
-    # DEVNULL cannot be asked what went wrong — and the first three attempts at
-    # this failed silently, showing only a record that never advanced past
-    # "starting". Small, and swept with the record it sits beside.
-    log = directory / f"{job.id}.log"
-    try:
-        handle = log.open("w", encoding="utf-8", errors="replace")
-    except Exception:                                   # noqa: BLE001
-        handle = None
-
-    try:
-        subprocess.Popen(
-            [sys.executable, _worker_script(), str(spec)],
-            stdin=subprocess.DEVNULL,
-            stdout=handle or subprocess.DEVNULL,
-            stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            creationflags=creation,
-            start_new_session=(os.name != "nt"),
-            close_fds=True,
-        )
-    except Exception as e:                              # noqa: BLE001
-        job.state = FAILED
-        job.error = f"could not start a harvest process: {e}"
-        job.finished = time.time()
-        _publish(job)
-        _announce(job)
-    finally:
-        # Ours only for the handover; the child holds its own copy.
-        if handle is not None:
-            handle.close()
     return job
+
+
+def hand_off(label: str, kwargs: dict) -> Job | None:
+    """Ask the long-lived server to run this harvest, or None if none answers.
+
+    The server publishes its own status record, so the id comes back and every
+    other process — this one included — can watch it exactly as before.
+    """
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps({"label": label, "kwargs": kwargs}).encode()
+    request = urllib.request.Request(
+        SERVER.rstrip("/") + "/api/harvests", data=payload, method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=HANDOFF_TIMEOUT) as answer:
+            body = json.load(answer)
+    except Exception:                                   # noqa: BLE001
+        return None                                     # nobody is listening
+
+    job_id = str(body.get("job") or "")
+    if not job_id:
+        return None
+    found = next((j for j in _records() if j.id == job_id), None)
+    if found is not None:
+        return found
+    job = Job(id=job_id, label=label, started=time.time(), mine=False)
+    job.updated = time.time()
+    return job
+
+#: An id the next `start()` on *this thread* should adopt instead of minting
+#: one. Thread-local, not module state: the server runs one harvest per thread
+#: and two starting at once would otherwise swap ids with each other. Set by
+#: whoever reserved the record, consumed once.
+_adopt = threading.local()
+
+
+def adopt(job_id: str) -> None:
+    """The next `start()` on this thread continues `job_id`."""
+    _adopt.value = job_id
+
+
+def adopting() -> str:
+    return getattr(_adopt, "value", "") or ""
 
 
 def await_record(job_id: str, seconds: float) -> Job | None:

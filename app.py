@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from typing import Iterator
 
@@ -526,6 +527,55 @@ def config():
         "ready": any(p["available"] for p in catalog),
         "tools": [{"name": t.name, "description": t.description} for t in forge_tools.TOOLS],
     }
+
+
+@app.post("/api/harvests")
+def start_harvest(payload: dict):
+    """Run a harvest here, on behalf of a host that cannot survive one.
+
+    The stdio MCP server is launched per turn by the `claude` CLI and torn
+    down with it — and *with its whole job object*, so nothing it starts can
+    outlive the turn, however detached. Windows kills every process in a job
+    on close, and `CREATE_BREAKAWAY_FROM_JOB` is refused unless the job grants
+    it. No spawn flag wins that argument.
+
+    This process was never in that job. It is the host where background
+    harvests have always worked, and it is already the one showing the tracker.
+
+    The record is reserved before the thread starts, so the id can be returned
+    at once and the caller is never told to watch something that does not yet
+    exist.
+    """
+    kwargs = payload.get("kwargs") or {}
+    label = str(payload.get("label") or kwargs.get("name") or "").strip()
+    if not label or not isinstance(kwargs, dict):
+        return JSONResponse({"error": "a label and kwargs are required"},
+                            status_code=400)
+
+    # Already being fetched? Say so rather than crawl the site twice.
+    wanted = forge_tools._kb_slug(forge_tools._normalise(label) or label)
+    for other in harvest_jobs.running():
+        if forge_tools._kb_slug(
+                forge_tools._normalise(other.label) or other.label) == wanted:
+            return {"job": other.id, "already": True}
+
+    job = harvest_jobs.reserve(label)
+
+    def run() -> None:
+        harvest_jobs.adopt(job.id)
+        try:
+            forge_tools.tool_learn_technology(**kwargs)
+        except Exception as e:                          # noqa: BLE001
+            applog.error("harvest_handoff", f"{type(e).__name__}: {e}")
+            current = harvest_jobs.get(job.id)
+            if current is None or current.state == harvest_jobs.RUNNING:
+                job.state = harvest_jobs.FAILED
+                job.error = str(e) or type(e).__name__
+                job.finished = time.time()
+                harvest_jobs._publish(job)
+
+    threading.Thread(target=run, name=f"handoff:{job.id}", daemon=True).start()
+    return {"job": job.id}
 
 
 @app.get("/api/harvests")

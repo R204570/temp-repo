@@ -1,18 +1,20 @@
-"""A harvest must outlive the process that asked for it.
+"""A harvest must outlive the turn that asked for it, and three tries were wrong.
 
-Measured, driving the real stdio server with a harvest in flight and then
-tearing the server down two ways:
+The stdio MCP server is launched per turn by the `claude` CLI and torn down
+with it. Measured, in order:
 
-    close-stdin   process lived a further 232s   stored: 1.0.0.md
-    kill          process lived a further   2s   stored: NOTHING
+    1. wait before exiting     close-stdin  lived 232s   stored: 1.0.0.md
+                               kill         lived   2s   stored: NOTHING
+    2. spawn DETACHED_PROCESS  detached only          tick 4 -> 4   DIED
+                               detached + breakaway   never started  DIED
+    3. hand it to the server                                        works
 
-A client teardown *kills*. The linger that handles a polite hang-up cannot
-help, and nothing running inside a process someone else owns survives being
-killed — so under a short-lived host the harvest runs in a process of its own.
-
-End to end, with the MCP server killed twelve seconds in, the detached harvest
-went on to 209/307 pages and stored 3,563,589 bytes. These cover the pieces
-that end-to-end run exercises, without the network.
+A client tears its children down by closing their **job object**, and Windows
+kills every process in a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` however
+detached. `CREATE_BREAKAWAY_FROM_JOB` is refused unless the job grants it, and
+the child then fails to start at all. No spawn flag wins that argument, so the
+work has to *begin* somewhere the job never reached — the long-lived DocsForge
+server, which is also where background harvests have always worked.
 """
 import json
 import os
@@ -21,9 +23,11 @@ import threading
 import time
 
 import pytest
+from starlette.testclient import TestClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app
 import harvest_jobs
 from harvest_jobs import DONE, FAILED, RUNNING
 
@@ -31,11 +35,11 @@ from harvest_jobs import DONE, FAILED, RUNNING
 @pytest.fixture(autouse=True)
 def _clean():
     harvest_jobs.clear()
-    harvest_jobs.ADOPT = ""
+    harvest_jobs.adopt("")
     harvest_jobs.DETACHED = False
     yield
     harvest_jobs.clear()
-    harvest_jobs.ADOPT = ""
+    harvest_jobs.adopt("")
     harvest_jobs.DETACHED = False
 
 
@@ -43,18 +47,10 @@ def _clean():
 
 def test_an_infinite_deadline_waits_rather_than_raising():
     """`Event.wait(float("inf"))` raises OverflowError on Windows: "timestamp
-    out of range for platform time_t". The worker sets the deadline that way,
-    having nobody to hand back to early, and every harvest it ran died on that
-    overflow before this was handled."""
+    out of range for platform time_t"."""
     job = harvest_jobs.start("quick", lambda p: "stored")
     assert harvest_jobs.wait(job, float("inf")) is True
     assert job.state == DONE
-
-
-def test_an_infinite_module_deadline_also_waits(monkeypatch):
-    monkeypatch.setattr(harvest_jobs, "DEADLINE", float("inf"))
-    job = harvest_jobs.start("quick", lambda p: "stored")
-    assert harvest_jobs.wait(job) is True
 
 
 def test_a_finite_deadline_still_bounds_the_wait():
@@ -67,54 +63,115 @@ def test_a_finite_deadline_still_bounds_the_wait():
         gate.set()
 
 
-# ── adopting the launcher's record ──────────────────────────────
+# ── the id is reserved before the work starts ───────────────────
 
-def test_start_adopts_the_id_the_worker_was_given():
-    harvest_jobs.ADOPT = "mojo-7"
+def test_reserve_publishes_a_record_before_anything_runs():
+    """A caller handed an id must be able to find it at once. A gap where the
+    harvest just asked for cannot be found is what this exists to close."""
+    job = harvest_jobs.reserve("mojo")
+    assert (harvest_jobs.state_dir() / f"{job.id}.json").exists()
+    assert [j.id for j in harvest_jobs.running()] == [job.id]
+
+
+def test_start_adopts_the_reserved_id():
+    harvest_jobs.adopt("mojo-7")
     job = harvest_jobs.start("mojo", lambda p: "stored")
     harvest_jobs.wait(job, 5)
     assert job.id == "mojo-7"
-    assert harvest_jobs.ADOPT == "", "consumed once, not left to catch the next"
+    assert harvest_jobs.adopting() == "", "consumed once, not left for the next"
 
 
-def test_the_next_harvest_mints_its_own_id_again():
-    harvest_jobs.ADOPT = "mojo-7"
-    first = harvest_jobs.start("mojo", lambda p: "one")
-    harvest_jobs.wait(first, 5)
-    second = harvest_jobs.start("mojo", lambda p: "two")
-    harvest_jobs.wait(second, 5)
-    assert second.id != "mojo-7"
+def test_the_adopted_id_does_not_leak_between_threads():
+    """Two harvests starting at once would otherwise swap ids. The server runs
+    one per thread, so this is not hypothetical."""
+    harvest_jobs.adopt("mine-1")
+    seen = []
+
+    def other() -> None:
+        seen.append(harvest_jobs.adopting())
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    thread.join()
+
+    assert seen == [""], "another thread must not see this thread's id"
+    assert harvest_jobs.adopting() == "mine-1"
 
 
-def test_a_worker_is_not_blocked_by_its_own_launchers_record():
-    """The launcher publishes the record *before* the worker exists, so the
-    duplicate-harvest guard would otherwise read it and conclude the work was
-    already in hand — the worker refusing to do the job it was spawned for."""
+# ── handing the work to the long-lived server ───────────────────
+
+def test_hand_off_returns_none_when_nothing_is_listening(monkeypatch):
+    """Then the caller runs it here and says so, rather than promising
+    background work this host cannot keep."""
+    monkeypatch.setattr(harvest_jobs, "SERVER", "http://127.0.0.1:9")
+    monkeypatch.setattr(harvest_jobs, "HANDOFF_TIMEOUT", 0.5)
+    assert harvest_jobs.hand_off("mojo", {"name": "mojo"}) is None
+
+
+def test_the_tool_warns_when_a_harvest_cannot_outlive_the_turn():
     import forge_tools
 
+    forge_tools._log_no_server()
+    job = harvest_jobs.Job(id="mojo-1", label="mojo", started=time.time())
+    message = forge_tools._still_harvesting(job)
+    assert "will stop when this turn ends" in message
+    assert "python app.py" in message
+
+
+def test_the_warning_is_not_repeated_once_it_has_been_said():
+    import forge_tools
+
+    forge_tools._log_no_server()
+    job = harvest_jobs.Job(id="mojo-1", label="mojo", started=time.time())
+    assert "will stop when this turn ends" in forge_tools._still_harvesting(job)
+    assert "will stop when this turn ends" not in forge_tools._still_harvesting(job)
+
+
+# ── the endpoint the handoff calls ──────────────────────────────
+
+def test_the_server_starts_a_harvest_and_returns_its_id(monkeypatch):
+    started = threading.Event()
+
+    def fake(**kwargs):
+        harvest_jobs.start("mojo", lambda p: "stored")
+        started.set()
+        return "Harvested **mojo**"
+
+    import forge_tools
+    monkeypatch.setattr(forge_tools, "tool_learn_technology", fake)
+
+    with TestClient(app.app) as client:
+        body = client.post("/api/harvests",
+                           json={"label": "mojo", "kwargs": {"name": "mojo"}}).json()
+
+    assert body.get("job", "").startswith("mojo-")
+    assert started.wait(5), "the server must actually run it"
+    # The record exists from the moment the id is handed back.
+    assert (harvest_jobs.state_dir() / f"{body['job']}.json").exists()
+
+
+def test_the_server_refuses_a_request_with_no_label():
+    with TestClient(app.app) as client:
+        answer = client.post("/api/harvests", json={"kwargs": {}})
+    assert answer.status_code == 400
+
+
+def test_the_server_will_not_crawl_the_same_site_twice():
+    """The guard that already protects the local path protects this one too."""
     directory = harvest_jobs.state_dir()
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "mojo-1.json").write_text(json.dumps({
-        "id": "mojo-1", "label": "mojo", "state": RUNNING, "phase": "starting",
-        "url": "", "pages": 0, "expected": None,
+        "id": "mojo-1", "label": "mojo", "state": RUNNING, "phase": "harvesting",
+        "url": "", "pages": 3, "expected": 10,
         "started": time.time(), "updated": time.time(),
         "finished": 0.0, "error": "", "pid": 999, "result": "",
     }), encoding="utf-8")
 
-    running = harvest_jobs.running()
-    assert [j.id for j in running] == ["mojo-1"]
+    with TestClient(app.app) as client:
+        body = client.post("/api/harvests",
+                           json={"label": "Mojo", "kwargs": {"name": "Mojo"}}).json()
 
-    def blocked(adopt: str) -> bool:
-        harvest_jobs.ADOPT = adopt
-        wanted = forge_tools._kb_slug(forge_tools._normalise("mojo"))
-        return any(
-            not (j.id and j.id == harvest_jobs.ADOPT)
-            and forge_tools._kb_slug(
-                forge_tools._normalise(j.label) or j.label) == wanted
-            for j in running)
-
-    assert blocked(""), "a plain caller must still be told it is running"
-    assert not blocked("mojo-1"), "the worker must not block on its own record"
+    assert body == {"job": "mojo-1", "already": True}
 
 
 # ── watching another process's record settle ────────────────────
@@ -132,15 +189,13 @@ def _write(job_id: str, **over) -> None:
     (directory / f"{job_id}.json").write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_await_record_returns_the_result_the_worker_wrote():
-    """What keeps a small harvest feeling as it always did: a detached harvest
-    that finishes inside the deadline still returns its own summary inline."""
+def test_await_record_returns_the_result_the_server_wrote():
+    """What keeps a small harvest feeling as it always did: one that finishes
+    inside the deadline still returns its own summary inline."""
     _write("mojo-1", state=DONE, finished=time.time(),
            result="Harvested **mojo** 1.0.0 - 213 pages")
-
     settled = harvest_jobs.await_record("mojo-1", 3)
-    assert settled is not None
-    assert settled.state == DONE
+    assert settled is not None and settled.state == DONE
     assert "213 pages" in settled.result
 
 
@@ -158,69 +213,15 @@ def test_await_record_reports_a_failure_rather_than_waiting_it_out():
     assert "refused us" in settled.error
 
 
-# ── the worker only runs what it is meant to ────────────────────
+# ── handing off is off unless a short-lived host asks for it ────
 
-def test_the_worker_refuses_a_tool_it_was_not_built_to_run(tmp_path):
-    """The spec is an instruction to run code. It may name one function."""
-    import harvest_worker
-
-    spec = tmp_path / "bad.spec.json"
-    spec.write_text(json.dumps({"job": "x-1", "label": "x",
-                                "tool": "os.system", "kwargs": {}}),
-                    encoding="utf-8")
-    assert harvest_worker.run(spec) == 2
-
-
-def test_the_worker_refuses_a_spec_with_no_job_id(tmp_path):
-    import harvest_worker
-
-    spec = tmp_path / "bad.spec.json"
-    spec.write_text(json.dumps({"tool": "learn_technology", "kwargs": {}}),
-                    encoding="utf-8")
-    assert harvest_worker.run(spec) == 2
-
-
-def test_the_worker_refuses_an_unreadable_spec(tmp_path):
-    import harvest_worker
-
-    spec = tmp_path / "gone.spec.json"
-    assert harvest_worker.run(spec) == 2
-
-
-def test_harvest_docs_is_not_detachable():
-    """It is synchronous and publishes no record, so a detached run would
-    harvest correctly while leaving the launcher's record to go stale and be
-    reported as a process that vanished."""
-    import harvest_worker
-
-    assert harvest_worker.TOOLS == ("learn_technology",)
-
-
-def test_the_worker_takes_its_configuration_only_from_its_environment():
-    """It must not load `.env`. A launcher's environment is inherited already,
-    and re-reading the file resurrects what the launcher deliberately removed —
-    a test that unset `DOCSFORGE_DB` got a worker that found the file,
-    reconnected to a real database, and returned in one second having
-    harvested nothing."""
-    import inspect
-
-    import harvest_worker
-
-    source = inspect.getsource(harvest_worker)
-    assert "load_dotenv" not in source.split('"""')[-1], \
-        "the worker must not load .env outside its own explanation"
-
-
-# ── detaching is off unless a short-lived host asks for it ──────
-
-def test_detaching_is_off_by_default():
+def test_handing_off_is_off_by_default():
     assert harvest_jobs.DETACHED is False
 
 
-def test_the_stdio_server_turns_detaching_on():
+def test_the_stdio_server_turns_it_on():
     import inspect
 
     import mcp_server
 
-    source = inspect.getsource(mcp_server.main)
-    assert "DETACHED = True" in source
+    assert "DETACHED = True" in inspect.getsource(mcp_server.main)
