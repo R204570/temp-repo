@@ -37,7 +37,9 @@ is a record whose process died, and saying so is the whole point.
 from __future__ import annotations
 
 import json
+import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -189,6 +191,10 @@ class Job:
             "elapsed": self.elapsed,
             "error": self.error,
             "pid": self.pid,
+            # Carried so a caller in another process can return what the
+            # harvest produced, instead of only being able to say it finished.
+            # Bounded: this is a status record, not the corpus.
+            "result": self.result[:100_000],
         }
 
 
@@ -274,6 +280,7 @@ def _job_from_record(data: dict) -> Job | None:
             progress=progress,
             state=data.get("state", RUNNING),
             error=data.get("error", "") or "",
+            result=data.get("result", "") or "",
             finished=float(data.get("finished") or 0.0),
             pid=int(data.get("pid") or 0),
             updated=float(data.get("updated") or 0.0),
@@ -372,16 +379,27 @@ def _prune() -> None:
         _JOBS.pop(job.id, None)
 
 
-def start(label: str, work: Callable[[Progress], str]) -> Job:
+def start(label: str, work: Callable[[Progress], str],
+          job_id: str = "") -> Job:
     """Run `work` on its own thread. Returns immediately.
 
     `work` is handed the job's Progress to update as it goes, and whatever
     string it returns becomes the job's result — the same string the caller
     would have received had it waited.
+
+    `job_id` adopts an id somebody else already published, which is how a
+    detached worker continues the record its launcher created rather than
+    minting a second one for the same harvest. `ADOPT` is the same thing for
+    a caller that cannot reach this argument — `tool_learn_technology` builds
+    its own `work` and calls this itself, so the worker leaves the id here
+    instead of threading a parameter through the tool layer.
     """
+    global ADOPT
     with _LOCK:
-        job = Job(id=_new_id(label), label=label, started=time.time(),
-                  pid=os.getpid())
+        adopted = job_id or ADOPT
+        ADOPT = ""
+        job = Job(id=adopted or _new_id(label), label=label,
+                  started=time.time(), pid=os.getpid())
         _JOBS[job.id] = job
         _prune()
 
@@ -429,9 +447,132 @@ def start(label: str, work: Callable[[Progress], str]) -> Job:
     return job
 
 
+#: Run harvests in a process of their own rather than on a thread here.
+#:
+#: Off by default, because `app.py` is the common host and it outlives any
+#: turn — a thread there is simpler, and it is what feeds the live trace.
+#: The stdio MCP server turns it on, because it is launched per turn by the
+#: `claude` CLI and torn down with it.
+#:
+#: Measured, driving the real server over stdio with a harvest in flight:
+#:
+#:     close-stdin   process lived a further 232s   stored: 1.0.0.md
+#:     kill          process lived a further   2s   stored: NOTHING
+#:
+#: The linger added for the first case is powerless against the second, and
+#: the second is what a client teardown actually does. Nothing that runs
+#: inside a process someone else owns can survive being killed — so the
+#: harvest has to stop being a child of the CLI.
+DETACHED = False
+
+#: An id the next `start()` should adopt instead of minting one. Set by the
+#: detached worker, consumed once. Module state rather than a parameter
+#: because the call that needs it is inside the tool layer, several frames
+#: from anything the worker can reach.
+ADOPT = ""
+
+
+def _worker_script() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "harvest_worker.py")
+
+
+def spawn_detached(label: str, tool: str, kwargs: dict) -> Job:
+    """Run one harvest in a process that outlives whatever launched it.
+
+    The record is published *here*, before the worker exists, so a caller
+    never sees a gap where the harvest it just asked for cannot be found.
+    The worker then adopts that id and takes the record over.
+
+    Deliberately still not a queue: nothing is resumed, nothing is retried,
+    and a worker that dies leaves a record whose heartbeat stops and which is
+    therefore reported stalled. What changed is only *whose* death takes the
+    harvest with it.
+    """
+    with _LOCK:
+        job = Job(id=_new_id(label), label=label, started=time.time())
+    _publish(job)                       # exists before the worker does
+    _announce(job)
+
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    spec = directory / f"{job.id}.spec.json"
+    spec.write_text(json.dumps({"job": job.id, "label": label,
+                                "tool": tool, "kwargs": kwargs}),
+                    encoding="utf-8")
+
+    creation = 0
+    if os.name == "nt":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console, and no
+        # Ctrl-C delivered to us because somebody signalled our parent.
+        creation = 0x00000008 | 0x00000200
+
+    # Its own log, beside its record. A detached process whose output goes to
+    # DEVNULL cannot be asked what went wrong — and the first three attempts at
+    # this failed silently, showing only a record that never advanced past
+    # "starting". Small, and swept with the record it sits beside.
+    log = directory / f"{job.id}.log"
+    try:
+        handle = log.open("w", encoding="utf-8", errors="replace")
+    except Exception:                                   # noqa: BLE001
+        handle = None
+
+    try:
+        subprocess.Popen(
+            [sys.executable, _worker_script(), str(spec)],
+            stdin=subprocess.DEVNULL,
+            stdout=handle or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            creationflags=creation,
+            start_new_session=(os.name != "nt"),
+            close_fds=True,
+        )
+    except Exception as e:                              # noqa: BLE001
+        job.state = FAILED
+        job.error = f"could not start a harvest process: {e}"
+        job.finished = time.time()
+        _publish(job)
+        _announce(job)
+    finally:
+        # Ours only for the handover; the child holds its own copy.
+        if handle is not None:
+            handle.close()
+    return job
+
+
+def await_record(job_id: str, seconds: float) -> Job | None:
+    """Watch another process's record until it settles, or the time is up.
+
+    This is what keeps a small harvest feeling the way it always did. A
+    detached harvest that finishes inside the deadline still returns its own
+    summary inline, because the worker writes the result into the record and
+    the launcher reads it back — rather than every harvest, however tiny,
+    coming back as "still running".
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        found = next((j for j in _records() if j.id == job_id), None)
+        if found is not None and found.state != RUNNING:
+            return found
+        time.sleep(0.25)
+    return None
+
+
 def wait(job: Job, seconds: float | None = None) -> bool:
-    """Block up to `seconds`. True if the job finished within them."""
-    return job.done.wait(DEADLINE if seconds is None else seconds)
+    """Block up to `seconds`. True if the job finished within them.
+
+    An infinite limit means "no limit", and has to be passed as *no argument*
+    rather than as `inf`: `Event.wait(float("inf"))` raises `OverflowError:
+    timestamp out of range for platform time_t` on Windows. The detached
+    worker, which exists for exactly one harvest and has nobody to hand back
+    to early, sets the deadline that way — and every harvest it ran died
+    instantly on that overflow before this handled it.
+    """
+    limit = DEADLINE if seconds is None else seconds
+    if limit is None or not math.isfinite(limit):
+        return job.done.wait()
+    return job.done.wait(limit)
 
 
 def get(job_id: str) -> Job | None:

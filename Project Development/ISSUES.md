@@ -134,11 +134,45 @@ reached before:
 
 **Why this stays a DECISION.** Two gaps the linger does not close:
 
-- **It assumes the client closes stdin and waits.** If Claude Code sends
-  SIGTERM or SIGKILL shortly after hanging up, no in-process fix can help. The
-  robust answer is for the harvest not to be a child of the CLI at all —
-  a detached worker process, or handing the job to the long-lived `app.py` —
-  and that is a real architectural change, not a patch.
+- ~~**It assumes the client closes stdin and waits.**~~ **Measured, and it
+  does not.** Driving the real server over stdio with a harvest in flight and
+  tearing it down two ways:
+
+      close-stdin   process lived a further 232s   stored: 1.0.0.md
+      kill          process lived a further   2s   stored: NOTHING
+
+  A client teardown kills. The linger handles the case that does not happen.
+
+  **Fixed** by `harvest_worker.py`: under a short-lived host the harvest runs
+  in a process of its own, launched detached, which outlives everyone. End to
+  end with the MCP server killed twelve seconds in, the harvest went on to
+  209/307 pages and stored 3,563,589 bytes.
+
+  Five bugs on the way there, every one of them silent:
+
+  1. `Event.wait(float("inf"))` raises `OverflowError: timestamp out of range
+     for platform time_t` on Windows. The worker sets the deadline that way,
+     having nobody to hand back to early, so every harvest it ran died
+     instantly. `wait` now treats a non-finite limit as no argument.
+  2. `harvest_docs` never calls `start` — it is synchronous and publishes no
+     record. Detaching it would have harvested correctly while leaving the
+     launcher's record to go stale. It is off the worker's allow-list.
+  3. The worker called `load_dotenv`, which walked up from the repo, found the
+     developer's `.env`, and **resurrected `DOCSFORGE_DB` that the caller had
+     deliberately unset** — reconnecting to a real database and returning in
+     one second having harvested nothing. A detached process that re-acquires
+     config its parent dropped cannot be pointed at a test store. It now takes
+     configuration only from the environment it is handed.
+  4. The launcher publishes the record *before* the worker exists, so the
+     worker's own duplicate-harvest guard read that record and concluded the
+     work was already in hand. The worker refused the job it was spawned for.
+  5. All of the above failed **silently**, because the worker's output went to
+     `DEVNULL` — three runs showed only a record stuck at "starting". Each
+     worker now writes `<job>.log` beside its record, swept with it.
+
+  Still not a queue: nothing is resumed, nothing is retried, and a worker that
+  dies leaves a record whose heartbeat stops and which is reported stalled.
+  What changed is only *whose* death takes the harvest with it.
 - **Hitting the bound loses everything.** Measured, with a deliberately short
   bound: ~180 of 213 pages fetched, abandoned, **0 bytes stored**. That is P1
   again, and it is P1's decision to make — but note that the store already

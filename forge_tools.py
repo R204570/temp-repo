@@ -1245,8 +1245,34 @@ def tool_learn_technology(name: str, version: str | None = None,
     # rather than a request.
     wanted = _kb_slug(_normalise(name) or name)
     for other in harvest_jobs.running():
+        # Not the record we are here to fulfil. A detached worker runs this
+        # function with the launcher's job id already published as running, so
+        # without this the worker reads its own record, concludes the harvest
+        # is already in hand, and returns having done nothing — which is
+        # exactly what happened, silently, three times over.
+        if other.id and other.id == harvest_jobs.ADOPT:
+            continue
         if _kb_slug(_normalise(other.label) or other.label) == wanted:
             return _still_harvesting(other)
+
+    # Under a host that will be torn down with the turn, the harvest goes into
+    # a process of its own. A thread here would die with us -- measured, and
+    # the reason: a client teardown *kills*, and the linger that handles a
+    # polite hang-up cannot help. Everything below is unchanged, because a
+    # detached harvest that finishes inside the deadline still returns its own
+    # summary: the worker writes the result into the record and we read it back.
+    if harvest_jobs.DETACHED:
+        spawned = harvest_jobs.spawn_detached(
+            name, "learn_technology",
+            {"name": name, "version": version, "max_pages": max_pages,
+             "js": js, "intent": intent, "corpora": corpora, "strict": strict})
+        settled = harvest_jobs.await_record(spawned.id, harvest_jobs.DEADLINE)
+        if settled is not None and settled.state == harvest_jobs.DONE:
+            return settled.result
+        if settled is not None and settled.state == harvest_jobs.FAILED:
+            raise ForgeError(settled.error or f"Harvesting {name!r} failed.")
+        trace.detach()
+        return _still_harvesting(harvest_jobs.get(spawned.id) or spawned)
 
     # The harvest starts on its own thread and we wait on it -- but only up to
     # the deadline. Anything finishing in time returns exactly what it always

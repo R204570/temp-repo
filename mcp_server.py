@@ -161,6 +161,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"DocsForge MCP → http://{args.host}:{args.port}/mcp", file=sys.stderr)
         server.run(transport="streamable-http", host=args.host, port=args.port)
     else:
+        # This process is launched per turn by whatever client attached us --
+        # the `claude` CLI does exactly that -- and is torn down with it. A
+        # harvest on a thread here dies with us, and a teardown *kills* rather
+        # than closing politely, so the wait below cannot save one either.
+        # Measured, driving this server over stdio with a harvest in flight:
+        #
+        #     close-stdin   process lived a further 232s   stored: 1.0.0.md
+        #     kill          process lived a further   2s   stored: NOTHING
+        #
+        # So harvests started here run in a process of their own.
+        harvest_jobs.DETACHED = True
+
         # stdout is the protocol channel on stdio; never print to it.
         server.run(transport="stdio")
 
