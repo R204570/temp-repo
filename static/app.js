@@ -284,18 +284,46 @@ function traceArgs(meta) {
 /** What the operation returned. Rendered as text rather than parsed as
     Markdown: this view exists to show exactly what the model was handed,
     and rendering it would be showing something else. */
+/* FastMCP has no object schema for a tool that returns a bare string, so it
+   wraps the value as {"result": "..."} and that JSON is what reaches the
+   trace. Unwrapped server-side too; done here as well so a server that has
+   not been restarted still renders its output as text rather than as one
+   unbroken line of escaped newlines.
+
+   The same narrow rule on both sides: only an object whose single key is
+   `result`, holding a string. A tool that genuinely returns JSON keeps it,
+   because this panel's job is to show what the tool actually returned. */
+function unwrapResult(output) {
+  const text = String(output).trim();
+  if (!text.startsWith("{") || !text.endsWith("}")) return output;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return output;
+  }
+  const keys = parsed && typeof parsed === "object" ? Object.keys(parsed) : [];
+  if (keys.length === 1 && keys[0] === "result" && typeof parsed.result === "string") {
+    return parsed.result;
+  }
+  return output;
+}
+
 function traceOutput(ev) {
   if (!ev.output) return null;
+  // Once, so the character count names what is actually on screen. Counting
+  // the envelope while showing the contents would be off by the wrapper.
+  const shown = unwrapResult(ev.output);
   const box = el("div", "trace-output");
   const head = el("div", "trace-output-head");
   head.append(el("span", "trace-label", ev.state === "failed" ? "error output" : "output"));
   if (ev.omitted) {
     head.append(el("span", "trace-omitted",
-      `showing the first ${ev.output.length.toLocaleString()} characters, ` +
+      `showing the first ${shown.length.toLocaleString()} characters, ` +
       `${ev.omitted.toLocaleString()} more omitted`));
   }
   box.append(head);
-  box.append(el("pre", null, ev.output));
+  box.append(el("pre", null, shown));
   return box;
 }
 

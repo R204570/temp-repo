@@ -31,6 +31,36 @@ MCP_SERVER = os.path.join(HERE, "mcp_server.py")
 MCP_PREFIX = "mcp__docsforge__"
 
 
+def _unwrap_mcp_result(body: str) -> str:
+    """Undo FastMCP's envelope, so a tool result reads as what the tool wrote.
+
+    A tool here returns a Markdown string. FastMCP has no object schema to put
+    a bare string in, so it wraps the value as `{"result": "..."}`, and that
+    JSON is what arrives in the text block. The execution trace was therefore
+    showing the user
+
+        {"result":"1 harvest still running:\\n- **langchain** - harvesting ...
+
+    one unbroken line of escaped newlines, rather than the report the tool
+    actually produced.
+
+    Deliberately narrow: only an object whose single key is `result`, holding a
+    string, is unwrapped. A tool that genuinely returns JSON keeps it, and
+    anything that does not parse is passed through untouched.
+    """
+    text = body.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return body
+    try:
+        loaded = json.loads(text)
+    except (ValueError, TypeError):
+        return body
+    if (isinstance(loaded, dict) and set(loaded) == {"result"}
+            and isinstance(loaded["result"], str)):
+        return loaded["result"]
+    return body
+
+
 def tool_names() -> list[str]:
     """Every tool the MCP server exposes, for `--allowedTools`.
 
@@ -190,6 +220,7 @@ class ClaudeCodeProvider(Provider):
                                 b.get("text", "") for b in body if isinstance(b, dict)
                             )
                         body = body if isinstance(body, str) else str(body)
+                        body = _unwrap_mcp_result(body)
                         if block.get("is_error"):
                             body = f"Error: {body}"
                         yield tool_end(name, body, _kind_of(body))
