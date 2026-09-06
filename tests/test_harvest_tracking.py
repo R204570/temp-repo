@@ -241,15 +241,31 @@ def test_a_second_learn_technology_does_not_crawl_the_same_site_twice():
 
 
 def test_a_different_technology_is_not_blocked_by_a_running_one():
+    """The guard matches on the name, so an unrelated harvest passes it.
+
+    Asserted against the guard rather than by calling the tool. Calling it
+    started a *live* resolution: the test returned in milliseconds, monkeypatch
+    put `DOCSFORGE_HARVEST_STATE` back, and the harvest thread — still running
+    — published its next heartbeat into the developer's real state directory,
+    where it sat as a stalled harvest for a name nobody had asked for.
+    """
     import forge_tools
 
     _write_record(id="langchain-1", label="langchain")
-    # A name that cannot resolve returns an error rather than starting a
-    # crawl, which is enough to show it was not short-circuited by langchain.
-    try:
-        forge_tools.tool_learn_technology(name="zzzz-not-a-real-package-zzzz")
-    except Exception as e:                                  # noqa: BLE001
-        assert "langchain" not in str(e)
+    running = harvest_jobs.running()
+    assert [j.label for j in running] == ["langchain"]
+
+    def blocked_by(name: str) -> bool:
+        wanted = forge_tools._kb_slug(forge_tools._normalise(name) or name)
+        return any(
+            forge_tools._kb_slug(
+                forge_tools._normalise(j.label) or j.label) == wanted
+            for j in running)
+
+    assert blocked_by("langchain"), "the same name must be recognised"
+    assert blocked_by("LangChain"), "and recognised however it is spelled"
+    assert not blocked_by("mojo")
+    assert not blocked_by("langsmith")
 
 
 # ── a short-lived host has to wait for its own harvests ────────
