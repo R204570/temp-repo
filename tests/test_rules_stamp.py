@@ -76,8 +76,8 @@ def fingerprint() -> str:
 
 
 #: Bump `RULES` and update this together, never one without the other.
-FINGERPRINT = "6f6f928956f07194"
-EXPECTED_RULES = 2
+FINGERPRINT = "c3c9a8d65e74a9eb"
+EXPECTED_RULES = 3
 
 
 def test_rules_is_bumped_when_the_decision_logic_changes():
