@@ -200,6 +200,45 @@ def _is_docs_host(url: str) -> bool:
     return host.startswith(("docs.", "developer.", "devdocs.")) or ".readthedocs." in host
 
 
+#: Hosts and paths that publish a *generated symbol reference* rather than
+#: documentation to learn from. Both are real documentation and neither is
+#: refused — a signature is exactly what you want when you need a signature —
+#: but asked for "the documentation" they are the wrong half.
+_REFERENCE_HOSTS = ("reference.", "api.", "apidocs.", "apiref.",
+                    "javadoc.", "rustdoc.", "godoc.", "pkg.")
+_REFERENCE_PATHS = ("/reference", "/api-reference", "/apiref", "/javadoc",
+                    "/godoc", "/api/reference")
+
+
+def is_reference_site(url: str) -> bool:
+    """Is this a generated API reference rather than prose documentation?
+
+    Recognised by name, which is free and needs no fetch. `langchain` resolved
+    to `reference.langchain.com` and harvested 560 pages averaging 490
+    characters — one attribute per page:
+
+        # action > **Attribute** in `langchain`
+        ## Signature
+        action: Literal['accept']
+
+    Measuring instead of naming was tried and does not separate them at the
+    point the decision is made: sampled at their roots, that reference manifest
+    runs to a median of 1,774 characters against the docs site's 5,023 — close
+    enough that any threshold would be a coin toss. The thinness only shows up
+    two levels down, long after a URL has been chosen. The subdomain says it
+    outright and says it for free.
+
+    `docs.` beats `reference.` on its own via `docs-host`, so this matters for
+    the case that signal cannot reach: a project whose reference lives on a
+    subdomain and whose guides live on the bare domain.
+    """
+    host = _host(url)
+    if host.startswith(_REFERENCE_HOSTS):
+        return True
+    path = (urlparse(url).path or "").lower().rstrip("/")
+    return path.startswith(_REFERENCE_PATHS)
+
+
 def _visible_text(html: str) -> str:
     """Roughly what a reader would see, for measuring whether a page is empty."""
     body = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html or "")
@@ -893,6 +932,12 @@ def evidence(candidate: Candidate) -> tuple:
     return (
         0 if is_forge(candidate.url) else 1,
         1 if "docs-host" in signals else 0,
+        # A generated symbol reference is documentation, and it is the wrong
+        # half of it for someone who asked how to use the thing. Below
+        # `docs-host`, which already separates `docs.` from `reference.`, so
+        # this only decides what that signal cannot reach: a project whose
+        # reference sits on a subdomain and whose guides sit on the bare name.
+        0 if is_reference_site(candidate.url) else 1,
         1 if "own-domain" in signals else 0,
         strong,
         named,
@@ -1072,7 +1117,10 @@ REJECT_TTL = 7 * 86400
 #:      new ranking never ran. The mechanism worked; nobody turned the handle.
 #:      `test_rules_is_bumped_when_the_decision_logic_changes` now fails when
 #:      the deciding functions change without this number moving.
-RULES = 2
+#:   3  `is_reference_site` — a generated symbol reference ranks below prose
+#:      documentation. Bumped because the tripwire from 2 demanded it, which
+#:      is the whole of what that test is for.
+RULES = 3
 
 
 def _cache_file() -> Path:

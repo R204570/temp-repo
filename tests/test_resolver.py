@@ -608,3 +608,50 @@ def test_nothing_verified_means_no_answer():
     a = Candidate("https://a.dev/", "pypi:Homepage", 0.9, "", False, "no")
     b = Candidate("https://b.dev/", "pypi:Homepage", 0.8, "", None, "")
     assert resolver.best_verified([a, b]) is None
+
+
+# --- a generated symbol reference is the wrong half of the documentation -----
+
+def test_a_reference_subdomain_is_recognised_without_a_fetch():
+    for url in ("https://reference.langchain.com/python/langchain/",
+                "https://api.example.com/v2/",
+                "https://apidocs.example.io/",
+                "https://javadoc.example.org/",
+                "https://pkg.go.dev/net/http"):
+        assert resolver.is_reference_site(url), url
+
+
+def test_a_reference_path_counts_too():
+    assert resolver.is_reference_site("https://x.dev/reference/widgets")
+    assert resolver.is_reference_site("https://x.dev/api-reference")
+
+
+def test_ordinary_documentation_is_not_mistaken_for_a_reference():
+    for url in ("https://docs.langchain.com/", "https://mojolang.org/docs/",
+                "https://htmx.org/docs/", "https://x.dev/guide/intro",
+                "https://apify.com/", "https://api-platform.com/"):
+        assert not resolver.is_reference_site(url), url
+
+
+def test_the_reference_site_loses_to_the_projects_own_docs():
+    """What the user asked for: the reference must not win just because it
+    ranks well on everything else."""
+    reference = _cand("https://reference.langchain.com/python/langchain/",
+                      ["own-domain", "names-it:40"], 0.92, "pypi:Documentation")
+    docs = _cand("https://docs.langchain.com/", ["own-domain", "docs-host"], 0.78)
+    assert resolver.best_verified([reference, docs]) is docs
+
+
+def test_the_reference_loses_to_a_plain_site_that_docs_host_cannot_separate():
+    """The case `docs-host` cannot reach: reference on a subdomain, guides on
+    the bare name. Neither is a `docs.` host, so the tier below decides."""
+    reference = _cand("https://reference.thing.dev/", ["own-domain", "names-it:50"])
+    site = _cand("https://thing.dev/", ["own-domain", "names-it:12"])
+    assert resolver.best_verified([reference, site]) is site
+
+
+def test_a_reference_still_wins_when_it_is_the_only_thing_verified():
+    """Demotion, never refusal — a signature is exactly what you want when
+    you need a signature."""
+    only = _cand("https://reference.thing.dev/", ["own-domain", "names-it:9"])
+    assert resolver.best_verified([only]) is only
