@@ -1061,7 +1061,18 @@ REJECT_TTL = 7 * 86400
 #: name whose failure prompted the fix. Entries written before this stamp
 #: existed carry no `rules` key and are discarded on sight, which is the
 #: intended effect: they were all decided under rules that have since moved.
-RULES = 1
+#:
+#: History, because the bump is the part that gets forgotten:
+#:
+#:   1  the stamp itself, and the forge/`lang`-domain ownership rules
+#:   2  `best_verified` — read every candidate and compare, ranked by what the
+#:      signals mean. Missing this bump is why the fix did not reach anyone:
+#:      a cache holding `langchain -> reference.langchain.com` at `rules: 1`
+#:      still matched, so `recall` served the old answer in one second and the
+#:      new ranking never ran. The mechanism worked; nobody turned the handle.
+#:      `test_rules_is_bumped_when_the_decision_logic_changes` now fails when
+#:      the deciding functions change without this number moving.
+RULES = 2
 
 
 def _cache_file() -> Path:
