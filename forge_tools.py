@@ -28,6 +28,7 @@ from docsforge import (
 )
 import applog
 import harvest_jobs
+import llmsfinder
 import reasoning
 import tracing
 import versions
@@ -922,6 +923,14 @@ def tool_harvest_docs(url: str, name: str | None = None, max_pages: int = 0,
         )
 
     warning += note
+
+    # What shape is this corpus? A caller who asked for "the documentation" and
+    # received 560 pages averaging 490 characters -- one API symbol each -- has
+    # something that cannot answer the question they were about to ask, and
+    # nothing in the numbers above would have told them.
+    shape_note = llmsfinder.density_note([len(d.markdown) for d in docs])
+    if shape_note:
+        warning += "\n\n" + shape_note
 
     where = entry["file"]
     trace.event(
