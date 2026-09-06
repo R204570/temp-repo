@@ -87,6 +87,72 @@ def classify_llms_shape(text: str) -> str:
     return "dump"
 
 
+#: Below this median page size a corpus is a set of stubs, not prose
+#: documentation. Measured over every corpus in a real store rather than
+#: tuned against the one example that raised the question:
+#:
+#:      median  <500ch  pages   corpus
+#:         169     65%   1799   google-adk      split dump fragments
+#:         490     53%    560   langchain       one API symbol per page
+#:       2,112      0%     87   gin-gonic
+#:       3,896     11%    385   astro
+#:       3,973      5%    703   effect
+#:       4,411      0%     13   mojo
+#:       6,879      1%     85   pydantic
+#:      17,870      0%     16   go-net-http
+#:
+#: Everything genuine sits at 2,112 or above; both stub corpora sit at 490 or
+#: below. 1,200 is the midpoint of a 4.3x gap, so it is not a knife edge.
+STUB_MEDIAN = 1_200
+
+#: A median over three pages is noise, and a small corpus of short pages is a
+#: perfectly ordinary thing — a handful of guides, a README. The claim needs
+#: enough pages to be a claim.
+STUB_MIN_PAGES = 20
+
+
+def reads_as_stubs(sizes: list[int]) -> bool:
+    """Is this a set of stubs rather than documentation to read?
+
+    Not a judgement about worth: an API symbol index is real documentation and
+    is exactly what you want when you need a signature. It is a statement about
+    *shape*, and the shape matters because a caller who asked for "the
+    documentation" and received 560 pages averaging 490 characters — one
+    attribute each — has been handed something that cannot answer the question
+    they were going to ask.
+
+    Arithmetic, deliberately, like every other decision in this module. No
+    model call, no heuristic about wording.
+    """
+    if len(sizes) < STUB_MIN_PAGES:
+        return False
+    ordered = sorted(sizes)
+    median = ordered[len(ordered) // 2]
+    return median < STUB_MEDIAN
+
+
+def density_note(sizes: list[int]) -> str:
+    """One line for the caller when a corpus reads as stubs, else "".
+
+    Said rather than acted on. Refusing the harvest would throw away a real
+    corpus over a threshold, and silently switching to a different site would
+    be guessing at what was wanted — so this reports, and the caller decides.
+    """
+    if not reads_as_stubs(sizes):
+        return ""
+    ordered = sorted(sizes)
+    median = ordered[len(ordered) // 2]
+    tiny = sum(1 for s in sizes if s < 500)
+    return (
+        f"NOTE: these {len(sizes)} pages have a median of {median:,} characters "
+        f"and {tiny} of them are under 500. That is the shape of an API symbol "
+        f"index or a split dump, not prose documentation — useful for looking up "
+        f"a signature, thin for learning how something works. If you wanted "
+        f"guides and tutorials, check whether the project publishes them "
+        f"separately."
+    )
+
+
 def parse_llms_links(text: str, base_url: str) -> list[tuple[str, str]]:
     """Extract (title, absolute_url) from an llms.txt index."""
     found: list[tuple[str, str]] = []

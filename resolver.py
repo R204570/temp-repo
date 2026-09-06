@@ -859,6 +859,66 @@ def is_identified(signals: list[str]) -> bool:
     return len(strong) >= 2 or (len(strong) == 1 and named)
 
 
+def evidence(candidate: Candidate) -> tuple:
+    """How good an answer this verified candidate is. Higher is better.
+
+    Ranked on what the signals *mean*, not on how many there are. Counting
+    them was tried first and was worse than what it replaced: a GitHub
+    repository page is dense with the project's name and carries a backlink
+    and a registry agreement, so `langchain` ranked
+    `github.com/langchain-ai/langchainjs/tree/main/libs/langchain/` above
+    `docs.langchain.com`. Two strong signals and eighteen mentions, and it is
+    a source tree.
+
+    So the order asks three questions before it counts anything:
+
+      1. **Is this source or documentation?** A forge hosts the code. It can
+         still win when it is all there is -- many small libraries really do
+         document themselves in a README -- but never over a real docs site.
+      2. **Is it the project's own documentation host?** That is exactly what
+         `docs-host` means: owns the name *and* is a docs host. It is the
+         strongest thing a URL can say about itself here.
+      3. **Is it the project's own domain at all?**
+
+    Only then strong-signal count, mentions as corroboration, and the
+    source-type prior last -- purely to break a tie, since `confidence` is a
+    guess about the *kind* of source made before anything was read.
+    """
+    signals = set(candidate.signals)
+    strong = sum(1 for s in candidate.signals if s.startswith(STRONG))
+    named = 0
+    for signal in candidate.signals:
+        if signal.startswith("names-it:"):
+            named = int(signal.split(":", 1)[1])
+    return (
+        0 if is_forge(candidate.url) else 1,
+        1 if "docs-host" in signals else 0,
+        1 if "own-domain" in signals else 0,
+        strong,
+        named,
+        candidate.confidence,
+    )
+
+
+def best_verified(candidates: list[Candidate]) -> Candidate | None:
+    """The best-evidenced verified candidate, or None if none passed.
+
+    The loop used to stop at the *first* candidate that verified, walking in
+    confidence order — and confidence there is a prior about the **source
+    type**, not evidence about the page. `pypi:Documentation` outranks
+    `pypi:Homepage` before either has been read, so `langchain` resolved to
+    `reference.langchain.com` (an API symbol index, one attribute per page,
+    median 490 characters) while `docs.langchain.com` sat second at 0.78 and
+    was never even checked. The winner was not better, it was earlier.
+
+    Reading them all costs more requests, which the ladder's own budget still
+    bounds. It buys the ability to compare, and a resolution that cannot
+    compare cannot be said to have chosen.
+    """
+    passed = [c for c in candidates if c.verified]
+    return max(passed, key=evidence) if passed else None
+
+
 def verify(candidate: Candidate, name: str, fetcher: Fetcher,
            facts: dict | None = None, state=None) -> Candidate:
     """Confirm a page documents the project that was asked for.
@@ -1300,18 +1360,21 @@ def _resolve_uncached(name: str, ecosystem: str = "", fetcher: Fetcher | None = 
         #    it produced every correct answer and none of the wrong ones.
         domain = from_domains(name, fetcher, state=state)
         if verify_best:
-            for cand in domain:
+            # Read them all, then compare. Stopping at the first to pass made
+            # the ordering the decision -- see `best_verified`.
+            for cand in domain[:limit]:
                 verify(cand, name, fetcher, {"via_domain": True}, state=state)
-                if cand.verified:
-                    result.candidates = domain[:limit]
-                    result.best = cand
-                    result.resolved_via = "domain"
-                    result.note = (
-                        f"Resolved from {name!r}'s own domain. Registries were not "
-                        f"consulted: owning the name is the stronger claim, and "
-                        f"where the two disagree the registry is usually a "
-                        f"different project that shares the word.")
-                    return result
+            picked = best_verified(domain[:limit])
+            if picked is not None:
+                result.candidates = domain[:limit]
+                result.best = picked
+                result.resolved_via = "domain"
+                result.note = (
+                    f"Resolved from {name!r}'s own domain. Registries were not "
+                    f"consulted: owning the name is the stronger claim, and "
+                    f"where the two disagree the registry is usually a "
+                    f"different project that shares the word.")
+                return result
 
         # 2. Registries, as the fallback.
         found, hit = from_registries(name, result.ecosystem, fetcher)
@@ -1352,17 +1415,17 @@ def _resolve_uncached(name: str, ecosystem: str = "", fetcher: Fetcher | None = 
                 verify(cand, name, fetcher,
                        dict(facts, via_domain=cand.source.startswith("domain:")),
                        state=state)
-                if cand.verified:
-                    result.best = cand
-                    result.resolved_via = ("domain" if cand.source.startswith("domain:")
-                                           else "registry")
-                    # The ecosystem is whichever registry actually produced the
-                    # answer, not whichever one happened to reply first: the
-                    # same name often exists in several, on different projects.
-                    won = cand.source.split(":", 1)[0]
-                    if won in REGISTRIES:
-                        result.ecosystem = won
-                    break
+            picked = best_verified(result.candidates)
+            if picked is not None:
+                result.best = picked
+                result.resolved_via = ("domain" if picked.source.startswith("domain:")
+                                       else "registry")
+                # The ecosystem is whichever registry actually produced the
+                # answer, not whichever one happened to reply first: the
+                # same name often exists in several, on different projects.
+                won = picked.source.split(":", 1)[0]
+                if won in REGISTRIES:
+                    result.ecosystem = won
             if result.best is None:
                 result.note = (
                     f"Found {len(result.candidates)} candidate(s) for {name!r} but none "
